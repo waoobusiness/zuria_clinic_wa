@@ -35,12 +35,10 @@ const SESSIONS_DIR =
   path.join(process.cwd(), "sessions");
 
 // 🔄 Webhook (Make / Supabase / autre)
-const WEBHOOK_URL =
-  process.env.WA_WEBHOOK_URL || process.env.WEBHOOK_URL || "";
+const WEBHOOK_URL = process.env.WA_WEBHOOK_URL || process.env.WEBHOOK_URL || "";
 
 // 🌍 URL publique de la gateway (pour mediaUrl)
-const PUBLIC_URL =
-  process.env.WA_PUBLIC_URL || process.env.PUBLIC_URL || "";
+const PUBLIC_URL = process.env.WA_PUBLIC_URL || process.env.PUBLIC_URL || "";
 
 // ----------- App
 
@@ -112,7 +110,7 @@ function phoneToJid(to: string): string {
 /**
  * OUTBOUND LID resolution (best effort)
  * - accepte: numéro brut, PN JID, LID JID, g.us, etc.
- * - tente: PN -> LID via sock.signalRepository.lidMapping.getLIDForPN (qui déclenche USync dans Baileys v7)
+ * - tente: PN -> LID via sock.signalRepository.lidMapping.getLIDForPN
  */
 function normalizeToJid(to: string): string {
   const v = String(to || "").trim();
@@ -139,6 +137,24 @@ async function getLidForPnJid(sock: any, pnJid: string): Promise<string | null> 
   }
 }
 
+async function getPnForLidJid(sock: any, lidJid: string): Promise<string | null> {
+  const lidStore = sock?.signalRepository?.lidMapping;
+  if (!lidStore || typeof lidStore.getPNForLID !== "function") return null;
+
+  try {
+    const raw = await Promise.resolve(lidStore.getPNForLID(lidJid));
+    if (!raw) return null;
+
+    const s = String(raw);
+    if (!s) return null;
+
+    // selon impl, ça peut être "4178..." ou "4178...@s.whatsapp.net"
+    return s.includes("@") ? s : `${s}@s.whatsapp.net`;
+  } catch {
+    return null;
+  }
+}
+
 async function resolveRecipientJid(
   sock: any,
   to: string
@@ -147,9 +163,10 @@ async function resolveRecipientJid(
 
   if (!jid0) return { sendJid: "", toPn: null, toLid: null };
 
-  // Si déjà LID, on utilise tel quel
+  // Si déjà LID, on utilise tel quel, mais on essaie de retrouver le PN pour le webhook (best effort)
   if (jid0.endsWith("@lid")) {
-    return { sendJid: jid0, toPn: null, toLid: jid0 };
+    const pn = await getPnForLidJid(sock, jid0);
+    return { sendJid: jid0, toPn: pn, toLid: jid0 };
   }
 
   // Si pas PN, on ne tente pas de mapping (group/newsletter/etc.)
@@ -209,18 +226,14 @@ async function clearSessionAuth(orgId: string) {
 
 // ----------- Helpers divers
 
-// ✅ NOUVELLE VERSION : on NE considère pas @lid, @g.us, status, etc. comme des numéros de téléphone
+// ✅ on NE considère pas @lid, @g.us, status, etc. comme des numéros de téléphone
 function jidToPhone(jid?: string | null): string | null {
   if (!jid) return null;
 
   const [local, domain] = jid.split("@");
   if (!local) return null;
 
-  // Cas à ignorer pour le "numéro" :
-  // - LID
-  // - groupes
-  // - status / broadcast / newsletters
-  // - JID contenant un "-" (souvent groupes)
+  // Cas à ignorer pour le "numéro"
   if (
     domain === "lid" ||
     domain === "g.us" ||
@@ -270,11 +283,7 @@ function extractMessageBody(msg: WAMessage): string | undefined {
 
 // ----------- Helper: envoyer vers le webhook externe
 
-async function postWebhook(
-  event: string,
-  orgId: string,
-  payload: any
-): Promise<void> {
+async function postWebhook(event: string, orgId: string, payload: any): Promise<void> {
   if (!WEBHOOK_URL) return;
 
   try {
@@ -294,13 +303,13 @@ async function postWebhook(
 }
 
 // ----------- Helper: payload style Z-API pour un message
-// ➜ LID aware : on essaie de retrouver le PN via remoteJidAlt ou le store lidMapping
+// LID aware: on essaie de retrouver le PN via remoteJidAlt ou le store lidMapping
 
-function buildZapiLikeMessage(
+async function buildZapiLikeMessage(
   msg: WAMessage,
   sess: Session,
   orgId: string
-): any {
+): Promise<any> {
   const m: any = msg.message || {};
   const connectedPhone = getConnectedPhone(sess);
 
@@ -326,7 +335,8 @@ function buildZapiLikeMessage(
         const lidStore = (sess.sock as any).signalRepository?.lidMapping;
         if (lidStore && typeof lidStore.getPNForLID === "function") {
           try {
-            pnJid = lidStore.getPNForLID(remoteJid) || undefined;
+            const v = await Promise.resolve(lidStore.getPNForLID(remoteJid));
+            pnJid = v || undefined;
           } catch {
             // ignore erreurs de mapping
           }
@@ -359,6 +369,7 @@ function buildZapiLikeMessage(
   const base: any = {
     isStatusReply: false,
     chatLid, // LID si dispo, sinon null
+    remoteJidAlt: remoteJidAlt || null, // IMPORTANT: redondance utile pour le merge côté wa-webhook
     connectedPhone,
     waitingMessage: false,
     isEdit: false,
@@ -394,8 +405,7 @@ function buildZapiLikeMessage(
     base.audio = {
       ptt: !!m.audioMessage.ptt,
       seconds: m.audioMessage.seconds || 0,
-      audioUrl:
-        msg.key.id && PUBLIC_URL ? buildMediaUrl(orgId, msg.key.id) : null,
+      audioUrl: msg.key.id && PUBLIC_URL ? buildMediaUrl(orgId, msg.key.id) : null,
       mimeType: m.audioMessage.mimetype || "audio/ogg; codecs=opus",
       viewOnce: false,
     };
@@ -404,10 +414,8 @@ function buildZapiLikeMessage(
   // Image
   if (m.imageMessage) {
     base.image = {
-      imageUrl:
-        msg.key.id && PUBLIC_URL ? buildMediaUrl(orgId, msg.key.id) : null,
-      thumbnailUrl:
-        msg.key.id && PUBLIC_URL ? buildMediaUrl(orgId, msg.key.id) : null,
+      imageUrl: msg.key.id && PUBLIC_URL ? buildMediaUrl(orgId, msg.key.id) : null,
+      thumbnailUrl: msg.key.id && PUBLIC_URL ? buildMediaUrl(orgId, msg.key.id) : null,
       caption: m.imageMessage.caption || "",
       mimeType: m.imageMessage.mimetype || "image/jpeg",
       viewOnce: !!m.imageMessage.viewOnce,
@@ -419,8 +427,7 @@ function buildZapiLikeMessage(
   // Video
   if (m.videoMessage) {
     base.video = {
-      videoUrl:
-        msg.key.id && PUBLIC_URL ? buildMediaUrl(orgId, msg.key.id) : null,
+      videoUrl: msg.key.id && PUBLIC_URL ? buildMediaUrl(orgId, msg.key.id) : null,
       caption: m.videoMessage.caption || "",
       mimeType: m.videoMessage.mimetype || "video/mp4",
       viewOnce: !!m.videoMessage.viewOnce,
@@ -431,8 +438,7 @@ function buildZapiLikeMessage(
   // Document
   if (m.documentMessage) {
     base.document = {
-      documentUrl:
-        msg.key.id && PUBLIC_URL ? buildMediaUrl(orgId, msg.key.id) : null,
+      documentUrl: msg.key.id && PUBLIC_URL ? buildMediaUrl(orgId, msg.key.id) : null,
       fileName: m.documentMessage.fileName,
       mimeType: m.documentMessage.mimetype,
       fileSize: m.documentMessage.fileLength,
@@ -466,13 +472,9 @@ function normalizeChat(raw: any): ChatSummary | null {
   if (!raw || !raw.id) return null;
   const id = raw.id as string;
   const isGroup = id.endsWith("@g.us");
-  const name =
-    raw.name || raw.subject || raw.pushName || raw.formattedName || id;
+  const name = raw.name || raw.subject || raw.pushName || raw.formattedName || id;
   const lastMessageTimestamp = Number(
-    raw.conversationTimestamp ||
-      raw.lastMessageRecv?.messageTimestamp ||
-      raw.t ||
-      0
+    raw.conversationTimestamp || raw.lastMessageRecv?.messageTimestamp || raw.t || 0
   );
   const lastMessagePreview =
     raw.lastMessage?.conversation ||
@@ -533,7 +535,8 @@ async function startSession(orgId: string): Promise<Session> {
     logger,
     // on ne demande PAS l'historique complet, ça réduit la charge et la phase "AwaitingInitialSync"
     syncFullHistory: false,
-    markOnlineOnConnect: True,
+    // IMPORTANT: true (pas True)
+    markOnlineOnConnect: true,
   });
 
   sess.sock = sock;
@@ -576,8 +579,7 @@ async function startSession(orgId: string): Promise<Session> {
 
     // Fermé
     if (connection === "close") {
-      const code: number =
-        (lastDisconnect as any)?.error?.output?.statusCode ?? 0;
+      const code: number = (lastDisconnect as any)?.error?.output?.statusCode ?? 0;
 
       // Codes qu’on considère comme "non récupérables"
       const fatalCodes: number[] = [
@@ -609,7 +611,7 @@ async function startSession(orgId: string): Promise<Session> {
         sessions.delete(orgId);
         clearSessionAuth(orgId).catch(() => {});
       } else {
-        // 🔁 cas 515 / restartRequired & co → on relance la session avec les mêmes creds
+        // cas 515 / restartRequired & co -> on relance la session avec les mêmes creds
         setTimeout(() => {
           logger.info({ orgId, code }, "auto-restart WA session");
           startSession(orgId).catch((err) =>
@@ -657,7 +659,7 @@ async function startSession(orgId: string): Promise<Session> {
       contacts: Array.from(sess!.contacts.values()),
     });
 
-    // ❗ On NE pousse PAS cet historique vers le webhook
+    // On NE pousse PAS cet historique vers le webhook
   });
 
   // Chats & contacts live updates
@@ -687,8 +689,7 @@ async function startSession(orgId: string): Promise<Session> {
 
       const merged: ChatSummary = {
         ...existing,
-        unreadCount:
-          u.unreadCount !== undefined ? u.unreadCount : existing.unreadCount,
+        unreadCount: u.unreadCount !== undefined ? u.unreadCount : existing.unreadCount,
         lastMessageTimestamp:
           u.conversationTimestamp !== undefined
             ? Number(u.conversationTimestamp)
@@ -755,7 +756,7 @@ async function startSession(orgId: string): Promise<Session> {
   });
 
   // Messages entrants => cache + bus + webhook (INBOUND uniquement)
-  sock.ev.on("messages.upsert", (m: any) => {
+  sock.ev.on("messages.upsert", async (m: any) => {
     const up = m.messages || [];
     for (const msg of up as WAMessage[]) {
       if (msg.key && msg.key.id) {
@@ -775,14 +776,15 @@ async function startSession(orgId: string): Promise<Session> {
 
       if (remoteJid) {
         if (isLidChat && !isGroup) {
-          // DM avec LID -> essaie de retrouver le PN
+          // DM avec LID -> essaie de retrouver le PN (robuste sync/async)
           let pnJid: string | undefined = remoteJidAlt;
 
           if (!pnJid && sess!.sock) {
             const lidStore = (sess!.sock as any).signalRepository?.lidMapping;
             if (lidStore && typeof lidStore.getPNForLID === "function") {
               try {
-                pnJid = lidStore.getPNForLID(remoteJid) || undefined;
+                const v = await Promise.resolve(lidStore.getPNForLID(remoteJid));
+                pnJid = v || undefined;
               } catch {
                 // ignore
               }
@@ -817,9 +819,9 @@ async function startSession(orgId: string): Promise<Session> {
         message: simplified,
       });
 
-      // 🔔 Webhook Supabase (INBOUND) :
+      // 🔔 Webhook Supabase (INBOUND) uniquement
       if (!msg.key.fromMe) {
-        const zmsg = buildZapiLikeMessage(msg, sess!, orgId);
+        const zmsg = await buildZapiLikeMessage(msg, sess!, orgId);
 
         const webhookPayload = {
           ...simplified,
@@ -1050,19 +1052,14 @@ app.post("/wa/logout", async (req: Request, res: Response) => {
 app.post("/wa/send/text", async (req: Request, res: Response) => {
   const { orgId, to, text, quotedMsgId, mentions } = req.body || {};
   if (!orgId || !to || !text) {
-    return res
-      .status(400)
-      .json({ ok: false, error: "orgId,to,text required" });
+    return res.status(400).json({ ok: false, error: "orgId,to,text required" });
   }
 
   const s = getSessionOr404(String(orgId), res);
   if (!s) return;
 
   try {
-    const { sendJid, toPn, toLid } = await resolveRecipientJid(
-      s.sock,
-      String(to)
-    );
+    const { sendJid, toPn, toLid } = await resolveRecipientJid(s.sock, String(to));
 
     if (!sendJid) {
       return res.status(400).json({ ok: false, error: "Invalid recipient" });
@@ -1104,19 +1101,14 @@ app.post("/wa/send/text", async (req: Request, res: Response) => {
 app.post("/wa/send/image", async (req: Request, res: Response) => {
   const { orgId, to, caption, image } = req.body || {};
   if (!orgId || !to || !image) {
-    return res
-      .status(400)
-      .json({ ok: false, error: "orgId,to,image required" });
+    return res.status(400).json({ ok: false, error: "orgId,to,image required" });
   }
 
   const s = getSessionOr404(String(orgId), res);
   if (!s) return;
 
   try {
-    const { sendJid, toPn, toLid } = await resolveRecipientJid(
-      s.sock,
-      String(to)
-    );
+    const { sendJid, toPn, toLid } = await resolveRecipientJid(s.sock, String(to));
 
     if (!sendJid) {
       return res.status(400).json({ ok: false, error: "Invalid recipient" });
@@ -1157,10 +1149,7 @@ app.post("/wa/send/document", async (req: Request, res: Response) => {
   if (!s) return;
 
   try {
-    const { sendJid, toPn, toLid } = await resolveRecipientJid(
-      s.sock,
-      String(to)
-    );
+    const { sendJid, toPn, toLid } = await resolveRecipientJid(s.sock, String(to));
 
     if (!sendJid) {
       return res.status(400).json({ ok: false, error: "Invalid recipient" });
@@ -1201,19 +1190,14 @@ app.post("/wa/send/document", async (req: Request, res: Response) => {
 app.post("/wa/send/audio", async (req: Request, res: Response) => {
   const { orgId, to, ptt, audio } = req.body || {};
   if (!orgId || !to || !audio) {
-    return res
-      .status(400)
-      .json({ ok: false, error: "orgId,to,audio required" });
+    return res.status(400).json({ ok: false, error: "orgId,to,audio required" });
   }
 
   const s = getSessionOr404(String(orgId), res);
   if (!s) return;
 
   try {
-    const { sendJid, toPn, toLid } = await resolveRecipientJid(
-      s.sock,
-      String(to)
-    );
+    const { sendJid, toPn, toLid } = await resolveRecipientJid(s.sock, String(to));
 
     if (!sendJid) {
       return res.status(400).json({ ok: false, error: "Invalid recipient" });
@@ -1255,10 +1239,7 @@ app.post("/wa/send/buttons", async (req: Request, res: Response) => {
   if (!s) return;
 
   try {
-    const { sendJid, toPn, toLid } = await resolveRecipientJid(
-      s.sock,
-      String(to)
-    );
+    const { sendJid, toPn, toLid } = await resolveRecipientJid(s.sock, String(to));
 
     if (!sendJid) {
       return res.status(400).json({ ok: false, error: "Invalid recipient" });
@@ -1307,10 +1288,7 @@ app.post("/wa/send/list", async (req: Request, res: Response) => {
   if (!s) return;
 
   try {
-    const { sendJid, toPn, toLid } = await resolveRecipientJid(
-      s.sock,
-      String(to)
-    );
+    const { sendJid, toPn, toLid } = await resolveRecipientJid(s.sock, String(to));
 
     if (!sendJid) {
       return res.status(400).json({ ok: false, error: "Invalid recipient" });
@@ -1382,9 +1360,7 @@ app.get("/wa/messages/recent", (req: Request, res: Response) => {
 app.post("/wa/media/download", async (req: Request, res: Response) => {
   const { orgId, msgId } = req.body || {};
   if (!orgId || !msgId) {
-    return res
-      .status(400)
-      .json({ ok: false, error: "orgId,msgId required" });
+    return res.status(400).json({ ok: false, error: "orgId,msgId required" });
   }
 
   const s = getSessionOr404(String(orgId), res);
@@ -1392,9 +1368,7 @@ app.post("/wa/media/download", async (req: Request, res: Response) => {
 
   const msg = s.msgCache.get(String(msgId));
   if (!msg) {
-    return res
-      .status(404)
-      .json({ ok: false, error: "Message not in cache" });
+    return res.status(404).json({ ok: false, error: "Message not in cache" });
   }
 
   try {
@@ -1429,9 +1403,7 @@ app.post("/wa/media/download", async (req: Request, res: Response) => {
 app.get("/wa/media/:orgId/:msgId", async (req: Request, res: Response) => {
   const { orgId, msgId } = req.params;
   if (!orgId || !msgId) {
-    return res
-      .status(400)
-      .json({ ok: false, error: "orgId,msgId required" });
+    return res.status(400).json({ ok: false, error: "orgId,msgId required" });
   }
 
   const s = getSessionOr404(orgId, res);
@@ -1439,9 +1411,7 @@ app.get("/wa/media/:orgId/:msgId", async (req: Request, res: Response) => {
 
   const msg = s.msgCache.get(String(msgId));
   if (!msg) {
-    return res
-      .status(404)
-      .json({ ok: false, error: "Message not in cache" });
+    return res.status(404).json({ ok: false, error: "Message not in cache" });
   }
 
   try {
