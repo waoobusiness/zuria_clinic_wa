@@ -11,7 +11,13 @@
   "dependencies": {
     "@whiskeysockets/baileys": "7.0.0-rc.6",
     "express": "^4.19.2",
-    "pino": "^9.0.0"
+    "pino": "^9.0.0",
+    "cors": "^2.8.5",
+    "fs-extra": "^11.2.0",
+    "lru-cache": "^11.0.0",
+    "mime-types": "^2.1.35",
+    "eventemitter3": "^5.0.1",
+    "qrcode": "^1.5.3"
   },
   "devDependencies": {
     "typescript": "^5.6.3"
