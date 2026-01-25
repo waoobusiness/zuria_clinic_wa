@@ -28,20 +28,19 @@ const logger = pino({ level: process.env.LOG_LEVEL || "info" });
 
 const PORT = Number(process.env.PORT || 3000);
 
-// ✅ On prend d’abord SESSIONS_DIR, sinon DATA_DIR, sinon ./sessions
+// On prend d’abord SESSIONS_DIR, sinon DATA_DIR, sinon ./sessions
 const SESSIONS_DIR =
   process.env.SESSIONS_DIR ||
   process.env.DATA_DIR ||
   path.join(process.cwd(), "sessions");
 
-// 🔄 Webhook (Make / Supabase / autre)
+// Webhook (Make / Supabase / autre)
 const WEBHOOK_URL = process.env.WA_WEBHOOK_URL || process.env.WEBHOOK_URL || "";
 
-// 🌍 URL publique de la gateway (pour mediaUrl)
+// URL publique de la gateway (pour mediaUrl)
 const PUBLIC_URL = process.env.WA_PUBLIC_URL || process.env.PUBLIC_URL || "";
 
-// 🔐 API key optionnelle pour protéger /wa/resolve et /wa/send/*
-// Si vide, aucune protection (comportement actuel).
+// API key optionnelle pour protéger /wa/resolve et /wa/send/*
 const WA_API_KEY =
   process.env.WA_API_KEY ||
   process.env.GATEWAY_API_KEY ||
@@ -256,7 +255,7 @@ async function clearSessionAuth(orgId: string) {
 
 // ----------- Helpers divers
 
-// ✅ on NE considère pas @lid, @g.us, status, etc. comme des numéros de téléphone
+// On NE considère pas @lid, @g.us, status, etc. comme des numéros de téléphone
 function jidToPhone(jid?: string | null): string | null {
   if (!jid) return null;
 
@@ -915,7 +914,7 @@ app.get("/wa/qr", async (req: Request, res: Response) => {
   res.json({ ok: true, qr: s.qr, svg });
 });
 
-// ➕ Bootstrap : renvoyer les dernières conversations + contacts
+// Bootstrap : renvoyer les dernières conversations + contacts
 app.get("/wa/bootstrap", async (req: Request, res: Response) => {
   const orgId = String(req.query.orgId || "");
   const limit = Number(req.query.limit || 20);
@@ -934,7 +933,7 @@ app.get("/wa/bootstrap", async (req: Request, res: Response) => {
   res.json({ ok: true, chats: chats.slice(0, limit), contacts });
 });
 
-// ➕ Avatar à la demande
+// Avatar à la demande
 app.get("/wa/profile-picture", async (req: Request, res: Response) => {
   const orgId = String(req.query.orgId || "");
   const jid = String(req.query.jid || "");
@@ -973,7 +972,7 @@ app.post("/wa/logout", async (req: Request, res: Response) => {
   res.json({ ok: true });
 });
 
-// ----------- LID RESOLVE (DEBUG) : PN -> LID sans envoyer de message
+// ----------- LID RESOLVE (DEBUG) : PN -> LID (option ping)
 
 app.post("/wa/resolve", requireGatewayAuth, async (req: Request, res: Response) => {
   const { orgId, to, sendTest, testText } = req.body || {};
@@ -998,7 +997,7 @@ app.post("/wa/resolve", requireGatewayAuth, async (req: Request, res: Response) 
     if (sendTest) {
       const txt = String(testText || "ping");
       const sent = await s.sock!.sendMessage(sendJid, { text: txt });
-      sentKey = sent.key;
+      sentKey = sent?.key ?? null;
 
       // 3) best effort: retenter juste après si on n'avait pas de LID
       if (!toLid && toPn) {
