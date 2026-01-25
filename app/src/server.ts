@@ -533,7 +533,7 @@ async function startSession(orgId: string): Promise<Session> {
     logger,
     // on ne demande PAS l'historique complet, ça réduit la charge et la phase "AwaitingInitialSync"
     syncFullHistory: false,
-    markOnlineOnConnect: false,
+    markOnlineOnConnect: True,
   });
 
   sess.sock = sock;
