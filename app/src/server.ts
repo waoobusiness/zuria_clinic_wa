@@ -1,13 +1,13 @@
 // app/src/server.ts
 
-import express, { Request, Response, NextFunction } from "express";
+import express, { Request, Response } from "express";
 import cors from "cors";
 import pino from "pino";
 import fs from "fs-extra";
 import path from "path";
 import { LRUCache } from "lru-cache";
 import { lookup as mimeLookup } from "mime-types";
-import EventEmitter from "eventemitter3";
+import { EventEmitter } from "node:events";
 import QRCode from "qrcode";
 
 // Baileys
@@ -35,13 +35,12 @@ const SESSIONS_DIR =
   path.join(process.cwd(), "sessions");
 
 // Webhook (Make / Supabase / autre)
-const WEBHOOK_URL = process.env.WA_WEBHOOK_URL || process.env.WEBHOOK_URL || "";
+const WEBHOOK_URL =
+  process.env.WA_WEBHOOK_URL || process.env.WEBHOOK_URL || "";
 
 // URL publique de la gateway (pour mediaUrl)
-const PUBLIC_URL = process.env.WA_PUBLIC_URL || process.env.PUBLIC_URL || "";
-
-// Clé API optionnelle
-const WA_API_KEY = process.env.WA_API_KEY || process.env.API_KEY || "";
+const PUBLIC_URL =
+  process.env.WA_PUBLIC_URL || process.env.PUBLIC_URL || "";
 
 // ----------- App
 
@@ -49,28 +48,6 @@ const app = express();
 app.use(cors());
 app.use(express.json({ limit: "25mb" }));
 app.use(express.urlencoded({ extended: true, limit: "25mb" }));
-
-// ----------- Auth middleware (optionnel)
-
-function extractAuthToken(req: Request): string | null {
-  const auth = req.headers["authorization"];
-  if (typeof auth === "string" && auth.toLowerCase().startsWith("bearer ")) {
-    return auth.slice(7).trim();
-  }
-  const xk = req.headers["x-api-key"];
-  if (typeof xk === "string" && xk.trim()) return xk.trim();
-  return null;
-}
-
-function requireGatewayAuth(req: Request, res: Response, next: NextFunction) {
-  if (!WA_API_KEY) return next(); // pas de clé, pas de protection
-
-  const token = extractAuthToken(req);
-  if (!token || token !== WA_API_KEY) {
-    return res.status(401).json({ ok: false, error: "unauthorized" });
-  }
-  return next();
-}
 
 // ----------- Types & Stores
 
@@ -135,7 +112,7 @@ function phoneToJid(to: string): string {
 /**
  * OUTBOUND LID resolution (best effort)
  * - accepte: numéro brut, PN JID, LID JID, g.us, etc.
- * - tente: PN -> LID via sock.signalRepository.lidMapping.getLIDForPN
+ * - tente: PN -> LID via sock.signalRepository.lidMapping.getLIDForPN (qui déclenche USync dans Baileys v7)
  */
 function normalizeToJid(to: string): string {
   const v = String(to || "").trim();
@@ -155,24 +132,8 @@ async function getLidForPnJid(sock: any, pnJid: string): Promise<string | null> 
     const s = String(raw);
     if (!s) return null;
 
+    // selon impl, ça peut être "124..." ou "124...@lid"
     return s.includes("@") ? s : `${s}@lid`;
-  } catch {
-    return null;
-  }
-}
-
-async function getPnForLidJid(sock: any, lidJid: string): Promise<string | null> {
-  const lidStore = sock?.signalRepository?.lidMapping;
-  if (!lidStore || typeof lidStore.getPNForLID !== "function") return null;
-
-  try {
-    const raw = await Promise.resolve(lidStore.getPNForLID(lidJid));
-    if (!raw) return null;
-
-    const s = String(raw);
-    if (!s) return null;
-
-    return s.includes("@") ? s : `${s}@s.whatsapp.net`;
   } catch {
     return null;
   }
@@ -186,10 +147,9 @@ async function resolveRecipientJid(
 
   if (!jid0) return { sendJid: "", toPn: null, toLid: null };
 
-  // Si déjà LID, on utilise tel quel, mais on essaie de retrouver le PN pour le webhook (best effort)
+  // Si déjà LID, on utilise tel quel
   if (jid0.endsWith("@lid")) {
-    const pn = await getPnForLidJid(sock, jid0);
-    return { sendJid: jid0, toPn: pn, toLid: jid0 };
+    return { sendJid: jid0, toPn: null, toLid: jid0 };
   }
 
   // Si pas PN, on ne tente pas de mapping (group/newsletter/etc.)
@@ -256,6 +216,11 @@ function jidToPhone(jid?: string | null): string | null {
   const [local, domain] = jid.split("@");
   if (!local) return null;
 
+  // Cas à ignorer pour le "numéro" :
+  // - LID
+  // - groupes
+  // - status / broadcast / newsletters
+  // - JID contenant un "-" (souvent groupes)
   if (
     domain === "lid" ||
     domain === "g.us" ||
@@ -281,7 +246,9 @@ function getConnectedPhone(sess: Session): string | null {
 function buildMediaUrl(orgId: string, msgId: string): string | null {
   if (!PUBLIC_URL) return null;
   const base = PUBLIC_URL.replace(/\/+$/, "");
-  return `${base}/wa/media/${encodeURIComponent(orgId)}/${encodeURIComponent(msgId)}`;
+  return `${base}/wa/media/${encodeURIComponent(orgId)}/${encodeURIComponent(
+    msgId
+  )}`;
 }
 
 // ----------- Helper: extraire le texte d’un message
@@ -294,7 +261,8 @@ function extractMessageBody(msg: WAMessage): string | undefined {
   if (m.extendedTextMessage?.text) return m.extendedTextMessage.text as string;
   if (m.imageMessage?.caption) return m.imageMessage.caption as string;
   if (m.videoMessage?.caption) return m.videoMessage.caption as string;
-  if (m.buttonsMessage?.contentText) return m.buttonsMessage.contentText as string;
+  if (m.buttonsMessage?.contentText)
+    return m.buttonsMessage.contentText as string;
   if (m.listMessage?.description) return m.listMessage.description as string;
 
   return undefined;
@@ -302,7 +270,11 @@ function extractMessageBody(msg: WAMessage): string | undefined {
 
 // ----------- Helper: envoyer vers le webhook externe
 
-async function postWebhook(event: string, orgId: string, payload: any): Promise<void> {
+async function postWebhook(
+  event: string,
+  orgId: string,
+  payload: any
+): Promise<void> {
   if (!WEBHOOK_URL) return;
 
   try {
@@ -321,9 +293,10 @@ async function postWebhook(event: string, orgId: string, payload: any): Promise<
   }
 }
 
-// ----------- Helper: payload style Z-API pour un message (LID aware)
+// ----------- Helper: payload style Z-API pour un message
+// LID aware : on essaie de retrouver le PN via remoteJidAlt ou le store lidMapping
 
-async function buildZapiLikeMessage(msg: WAMessage, sess: Session, orgId: string): Promise<any> {
+function buildZapiLikeMessage(msg: WAMessage, sess: Session, orgId: string): any {
   const m: any = msg.message || {};
   const connectedPhone = getConnectedPhone(sess);
 
@@ -342,22 +315,25 @@ async function buildZapiLikeMessage(msg: WAMessage, sess: Session, orgId: string
 
   if (remoteJid) {
     if (isLidChat && !isGroup) {
+      // DM avec LID -> on essaie de retrouver le PN
       let pnJid: string | undefined = remoteJidAlt;
 
       if (!pnJid && sess.sock) {
         const lidStore = (sess.sock as any).signalRepository?.lidMapping;
         if (lidStore && typeof lidStore.getPNForLID === "function") {
           try {
-            const v = await Promise.resolve(lidStore.getPNForLID(remoteJid));
-            pnJid = v || undefined;
+            pnJid = lidStore.getPNForLID(remoteJid) || undefined;
           } catch {
-            // ignore
+            // ignore erreurs de mapping
           }
         }
       }
 
-      if (pnJid) phone = jidToPhone(pnJid);
+      if (pnJid) {
+        phone = jidToPhone(pnJid);
+      }
     } else {
+      // Cas classique (PN ou groupe)
       phone = jidToPhone(remoteJid);
     }
   }
@@ -370,12 +346,15 @@ async function buildZapiLikeMessage(msg: WAMessage, sess: Session, orgId: string
     (phone ? sess.contacts.get(`${phone}@s.whatsapp.net`) : undefined);
 
   const displayName =
-    contact?.name || contact?.shortName || (msg as any).pushName || phone || chatId;
+    contact?.name ||
+    contact?.shortName ||
+    (msg as any).pushName ||
+    phone ||
+    chatId;
 
   const base: any = {
     isStatusReply: false,
-    chatLid,
-    remoteJidAlt: remoteJidAlt || null,
+    chatLid, // LID si dispo, sinon null
     connectedPhone,
     waitingMessage: false,
     isEdit: false,
@@ -385,7 +364,7 @@ async function buildZapiLikeMessage(msg: WAMessage, sess: Session, orgId: string
     messageId: msg.key.id,
     remoteJid: chatId,
     chatId,
-    phone,
+    phone, // toujours un PN si on l’a trouvé, sinon null
     fromMe: !!msg.key.fromMe,
     momment: tsMs,
     status: msg.key.fromMe ? "SENT" : "RECEIVED",
@@ -400,9 +379,13 @@ async function buildZapiLikeMessage(msg: WAMessage, sess: Session, orgId: string
     fromApi: false,
   };
 
+  // Texte
   const body = extractMessageBody(msg);
-  if (body) base.text = { message: body };
+  if (body) {
+    base.text = { message: body };
+  }
 
+  // Audio
   if (m.audioMessage) {
     base.audio = {
       ptt: !!m.audioMessage.ptt,
@@ -413,6 +396,7 @@ async function buildZapiLikeMessage(msg: WAMessage, sess: Session, orgId: string
     };
   }
 
+  // Image
   if (m.imageMessage) {
     base.image = {
       imageUrl: msg.key.id && PUBLIC_URL ? buildMediaUrl(orgId, msg.key.id) : null,
@@ -425,6 +409,7 @@ async function buildZapiLikeMessage(msg: WAMessage, sess: Session, orgId: string
     };
   }
 
+  // Video
   if (m.videoMessage) {
     base.video = {
       videoUrl: msg.key.id && PUBLIC_URL ? buildMediaUrl(orgId, msg.key.id) : null,
@@ -435,6 +420,7 @@ async function buildZapiLikeMessage(msg: WAMessage, sess: Session, orgId: string
     };
   }
 
+  // Document
   if (m.documentMessage) {
     base.document = {
       documentUrl: msg.key.id && PUBLIC_URL ? buildMediaUrl(orgId, msg.key.id) : null,
@@ -444,9 +430,14 @@ async function buildZapiLikeMessage(msg: WAMessage, sess: Session, orgId: string
     };
   }
 
+  // Réaction
   if (m.reactionMessage) {
     base.reaction = {
-      value: m.reactionMessage.text || m.reactionMessage.emoji || m.reactionMessage.reaction || "",
+      value:
+        m.reactionMessage.text ||
+        m.reactionMessage.emoji ||
+        m.reactionMessage.reaction ||
+        "",
       time: tsMs,
       reactionBy: phone,
       referencedMessage: {
@@ -466,9 +457,13 @@ function normalizeChat(raw: any): ChatSummary | null {
   if (!raw || !raw.id) return null;
   const id = raw.id as string;
   const isGroup = id.endsWith("@g.us");
-  const name = raw.name || raw.subject || raw.pushName || raw.formattedName || id;
+  const name =
+    raw.name || raw.subject || raw.pushName || raw.formattedName || id;
   const lastMessageTimestamp = Number(
-    raw.conversationTimestamp || raw.lastMessageRecv?.messageTimestamp || raw.t || 0
+    raw.conversationTimestamp ||
+      raw.lastMessageRecv?.messageTimestamp ||
+      raw.t ||
+      0
   );
   const lastMessagePreview =
     raw.lastMessage?.conversation ||
@@ -501,6 +496,7 @@ function normalizeContact(raw: any): ContactSummary | null {
 async function startSession(orgId: string): Promise<Session> {
   let sess = sessions.get(orgId);
 
+  // Si déjà connecté, on renvoie
   if (sess?.sock && sess.status === "connected") {
     return sess;
   }
@@ -511,7 +507,10 @@ async function startSession(orgId: string): Promise<Session> {
   const { state, saveCreds } = await useMultiFileAuthState(authDir);
   const { version } = await fetchLatestBaileysVersion();
 
-  if (!sess) sess = createEmptySession(orgId);
+  if (!sess) {
+    sess = createEmptySession(orgId);
+  }
+
   sessions.set(orgId, sess);
 
   const sock = makeWASocket({
@@ -532,80 +531,112 @@ async function startSession(orgId: string): Promise<Session> {
   sess.status = "connecting";
   sess.qr = null;
 
+  // Sauvegarde des creds
   sock.ev.on("creds.update", saveCreds);
 
+  // (Optionnel) log si Baileys découvre des mappings PN<->LID
   sock.ev.on("lid-mapping.update", (m: any) => {
     logger.info({ orgId, m }, "lid-mapping.update");
   });
 
+  // Événements de connexion
   sock.ev.on("connection.update", (u: any) => {
     const { connection, lastDisconnect, qr } = u;
 
+    // QR reçu
     if (qr) {
       sess!.qr = qr;
       sess!.status = "qr";
       getBus(orgId).emit("status", { type: "qr", qr });
     }
 
+    // Ouvert
     if (connection === "open") {
       sess!.status = "connected";
       sess!.qr = null;
       getBus(orgId).emit("status", { type: "connected", user: sock.user });
       logger.info({ orgId }, "WA connected");
-      void postWebhook("connection.open", orgId, { user: sock.user });
+
+      // Webhook: statut connecté
+      void postWebhook("connection.open", orgId, {
+        user: sock.user,
+      });
       return;
     }
 
+    // Fermé
     if (connection === "close") {
-      const code: number = (lastDisconnect as any)?.error?.output?.statusCode ?? 0;
+      const code: number =
+        (lastDisconnect as any)?.error?.output?.statusCode ?? 0;
 
+      // Codes qu’on considère comme "non récupérables"
       const fatalCodes: number[] = [
-        DisconnectReason.loggedOut,
-        DisconnectReason.forbidden,
+        DisconnectReason.loggedOut, // 401
+        DisconnectReason.forbidden, // 403
         DisconnectReason.badSession,
-        DisconnectReason.connectionReplaced,
+        DisconnectReason.connectionReplaced, // 410
       ];
 
       const willReconnect = !fatalCodes.includes(code);
 
       sess!.status = "closed";
-      getBus(orgId).emit("status", { type: "closed", code, willReconnect });
+      getBus(orgId).emit("status", {
+        type: "closed",
+        code,
+        willReconnect,
+      });
 
       logger.warn({ orgId, code, willReconnect }, "WA closed");
-      void postWebhook("connection.close", orgId, { code, willReconnect });
+
+      // Webhook: statut fermé
+      void postWebhook("connection.close", orgId, {
+        code,
+        willReconnect,
+      });
 
       if (!willReconnect) {
+        // on supprime la session en mémoire & disque
         sessions.delete(orgId);
         clearSessionAuth(orgId).catch(() => {});
       } else {
+        // cas 515 / restartRequired & co -> on relance la session
         setTimeout(() => {
           logger.info({ orgId, code }, "auto-restart WA session");
-          startSession(orgId).catch((err) => logger.error({ err, orgId }, "failed to restart session"));
+          startSession(orgId).catch((err) =>
+            logger.error({ err, orgId }, "failed to restart session")
+          );
         }, 1000);
       }
     }
   });
 
+  // Historique initial (chats, contacts, messages)
   sock.ev.on("messaging-history.set", (payload: any) => {
     const { chats, contacts, messages, syncType } = payload || {};
 
     if (Array.isArray(chats)) {
       for (const c of chats) {
         const summary = normalizeChat(c);
-        if (summary) sess!.chats.set(summary.id, summary);
+        if (summary) {
+          sess!.chats.set(summary.id, summary);
+        }
       }
     }
 
     if (Array.isArray(contacts)) {
       for (const c of contacts) {
         const summary = normalizeContact(c);
-        if (summary) sess!.contacts.set(summary.id, summary);
+        if (summary) {
+          sess!.contacts.set(summary.id, summary);
+        }
       }
     }
 
     if (Array.isArray(messages)) {
       for (const msg of messages as WAMessage[]) {
-        if (msg.key && msg.key.id) sess!.msgCache.set(msg.key.id, msg);
+        if (msg.key && msg.key.id) {
+          sess!.msgCache.set(msg.key.id, msg);
+        }
       }
     }
 
@@ -615,8 +646,11 @@ async function startSession(orgId: string): Promise<Session> {
       chats: Array.from(sess!.chats.values()),
       contacts: Array.from(sess!.contacts.values()),
     });
+
+    // On NE pousse PAS cet historique vers le webhook
   });
 
+  // Chats & contacts live updates
   sock.ev.on("chats.upsert", (up: any) => {
     const arr = Array.isArray(up) ? up : up?.chats || [];
     const updated: ChatSummary[] = [];
@@ -629,7 +663,9 @@ async function startSession(orgId: string): Promise<Session> {
       }
     }
 
-    if (updated.length) getBus(orgId).emit("chats", { type: "upsert", chats: updated });
+    if (updated.length) {
+      getBus(orgId).emit("chats", { type: "upsert", chats: updated });
+    }
   });
 
   sock.ev.on("chats.update", (updates: any) => {
@@ -641,20 +677,25 @@ async function startSession(orgId: string): Promise<Session> {
 
       const merged: ChatSummary = {
         ...existing,
-        unreadCount: u.unreadCount !== undefined ? u.unreadCount : existing.unreadCount,
+        unreadCount:
+          u.unreadCount !== undefined ? u.unreadCount : existing.unreadCount,
         lastMessageTimestamp:
           u.conversationTimestamp !== undefined
             ? Number(u.conversationTimestamp)
             : existing.lastMessageTimestamp,
       };
 
-      if (u.name || u.subject) merged.name = u.name || u.subject;
+      if (u.name || u.subject) {
+        merged.name = u.name || u.subject;
+      }
 
       sess!.chats.set(id, merged);
       updated.push(merged);
     }
 
-    if (updated.length) getBus(orgId).emit("chats", { type: "update", chats: updated });
+    if (updated.length) {
+      getBus(orgId).emit("chats", { type: "update", chats: updated });
+    }
   });
 
   sock.ev.on("contacts.upsert", (up: any) => {
@@ -669,7 +710,12 @@ async function startSession(orgId: string): Promise<Session> {
       }
     }
 
-    if (updated.length) getBus(orgId).emit("contacts", { type: "upsert", contacts: updated });
+    if (updated.length) {
+      getBus(orgId).emit("contacts", {
+        type: "upsert",
+        contacts: updated,
+      });
+    }
   });
 
   sock.ev.on("contacts.update", (updates: any) => {
@@ -690,13 +736,21 @@ async function startSession(orgId: string): Promise<Session> {
       updated.push(merged);
     }
 
-    if (updated.length) getBus(orgId).emit("contacts", { type: "update", contacts: updated });
+    if (updated.length) {
+      getBus(orgId).emit("contacts", {
+        type: "update",
+        contacts: updated,
+      });
+    }
   });
 
-  sock.ev.on("messages.upsert", async (m: any) => {
+  // Messages entrants -> cache + bus + webhook (INBOUND uniquement)
+  sock.ev.on("messages.upsert", (m: any) => {
     const up = m.messages || [];
     for (const msg of up as WAMessage[]) {
-      if (msg.key && msg.key.id) sess!.msgCache.set(msg.key.id, msg);
+      if (msg.key && msg.key.id) {
+        sess!.msgCache.set(msg.key.id, msg);
+      }
 
       const key: any = msg.key || {};
       const remoteJid = key.remoteJid as string | undefined;
@@ -711,21 +765,23 @@ async function startSession(orgId: string): Promise<Session> {
 
       if (remoteJid) {
         if (isLidChat && !isGroup) {
+          // DM avec LID -> essaie de retrouver le PN
           let pnJid: string | undefined = remoteJidAlt;
 
           if (!pnJid && sess!.sock) {
             const lidStore = (sess!.sock as any).signalRepository?.lidMapping;
             if (lidStore && typeof lidStore.getPNForLID === "function") {
               try {
-                const v = await Promise.resolve(lidStore.getPNForLID(remoteJid));
-                pnJid = v || undefined;
+                pnJid = lidStore.getPNForLID(remoteJid) || undefined;
               } catch {
                 // ignore
               }
             }
           }
 
-          if (pnJid) phone = jidToPhone(pnJid);
+          if (pnJid) {
+            phone = jidToPhone(pnJid);
+          }
         } else {
           phone = jidToPhone(remoteJid);
         }
@@ -739,17 +795,28 @@ async function startSession(orgId: string): Promise<Session> {
         timestamp: (msg.messageTimestamp || 0).toString(),
         messageType,
         body,
-        phone,
+        phone, // PN si trouvé
         chatLid: isLidChat ? remoteJid : null,
         remoteJidAlt: remoteJidAlt || null,
         isGroup,
       };
 
-      getBus(orgId).emit("message", { type: "message", message: simplified });
+      // SSE pour UI
+      getBus(orgId).emit("message", {
+        type: "message",
+        message: simplified,
+      });
 
+      // Webhook Supabase (INBOUND)
       if (!msg.key.fromMe) {
-        const zmsg = await buildZapiLikeMessage(msg, sess!, orgId);
-        void postWebhook("message.incoming", orgId, { ...simplified, zapi: zmsg });
+        const zmsg = buildZapiLikeMessage(msg, sess!, orgId);
+
+        const webhookPayload = {
+          ...simplified,
+          zapi: zmsg,
+        };
+
+        void postWebhook("message.incoming", orgId, webhookPayload);
       }
     }
   });
@@ -766,19 +833,6 @@ async function startSession(orgId: string): Promise<Session> {
 
   return sess;
 }
-
-// ----------- Debug: lister les routes (utile pour diagnostiquer un 404)
-
-app.get("/debug/routes", (_req: Request, res: Response) => {
-  const stack = (app as any)?._router?.stack || [];
-  const routes = stack
-    .filter((l: any) => l.route && l.route.path)
-    .map((l: any) => ({
-      path: l.route.path,
-      methods: Object.keys(l.route.methods || {}),
-    }));
-  res.json({ ok: true, routes });
-});
 
 // ----------- SSE (événements temps réel)
 
@@ -858,7 +912,9 @@ app.get("/wa/sse", async (req: Request, res: Response) => {
 
 app.post("/wa/login", async (req: Request, res: Response) => {
   const { orgId } = req.body || {};
-  if (!orgId) return res.status(400).json({ ok: false, error: "orgId required" });
+  if (!orgId) {
+    return res.status(400).json({ ok: false, error: "orgId required" });
+  }
 
   try {
     const s = await startSession(String(orgId));
@@ -876,7 +932,9 @@ app.post("/wa/login", async (req: Request, res: Response) => {
 
 app.get("/wa/status", async (req: Request, res: Response) => {
   const orgId = String(req.query.orgId || "");
-  if (!orgId) return res.status(400).json({ ok: false, error: "orgId required" });
+  if (!orgId) {
+    return res.status(400).json({ ok: false, error: "orgId required" });
+  }
 
   const s = sessions.get(orgId);
   res.json({
@@ -890,66 +948,17 @@ app.get("/wa/status", async (req: Request, res: Response) => {
 
 app.get("/wa/qr", async (req: Request, res: Response) => {
   const orgId = String(req.query.orgId || "");
-  if (!orgId) return res.status(400).json({ ok: false, error: "orgId required" });
+  if (!orgId) {
+    return res.status(400).json({ ok: false, error: "orgId required" });
+  }
 
   const s = sessions.get(orgId);
-  if (!s?.qr) return res.status(404).json({ ok: false, error: "No pending QR" });
+  if (!s?.qr) {
+    return res.status(404).json({ ok: false, error: "No pending QR" });
+  }
 
   const svg = await QRCode.toString(s.qr, { type: "svg" });
   res.json({ ok: true, qr: s.qr, svg });
-});
-
-// ----------- LID RESOLVE (DEBUG) : PN -> LID (option ping)
-// Une seule définition (corrigée). Payload flexible: to|phone|phoneNumber
-
-app.post("/wa/resolve", requireGatewayAuth, async (req: Request, res: Response) => {
-  const body = req.body || {};
-
-  const orgId = String(body.orgId || "");
-  const to = String(body.to || body.phone || body.phoneNumber || "");
-  const sendTest = Boolean(body.sendTest);
-  const testText = String(body.testText || "ping");
-
-  if (!orgId || !to) {
-    return res.status(400).json({ ok: false, error: "orgId,to required" });
-  }
-
-  const s = getSessionOr404(String(orgId), res);
-  if (!s) return;
-
-  try {
-    let { sendJid, toPn, toLid } = await resolveRecipientJid(s.sock, to);
-
-    if (!sendJid) return res.status(400).json({ ok: false, error: "Invalid recipient" });
-
-    let sentKey: any = null;
-
-    if (sendTest) {
-      const sent = await s.sock!.sendMessage(sendJid, { text: testText });
-      sentKey = sent?.key ?? null;
-
-      if (!toLid && toPn) {
-        const lidTry = await getLidForPnJid(s.sock, toPn);
-        if (lidTry) {
-          toLid = lidTry;
-          sendJid = lidTry;
-        }
-      }
-    }
-
-    return res.json({
-      ok: true,
-      orgId,
-      input: to,
-      toPn,
-      toLid,
-      sendJid,
-      sentKey,
-    });
-  } catch (err) {
-    logger.error({ err, orgId, to }, "GW /wa/resolve error");
-    return res.status(500).json({ ok: false, error: String(err) });
-  }
 });
 
 // Bootstrap : renvoyer les dernières conversations + contacts
@@ -957,10 +966,14 @@ app.get("/wa/bootstrap", async (req: Request, res: Response) => {
   const orgId = String(req.query.orgId || "");
   const limit = Number(req.query.limit || 20);
 
-  if (!orgId) return res.status(400).json({ ok: false, error: "orgId required" });
+  if (!orgId) {
+    return res.status(400).json({ ok: false, error: "orgId required" });
+  }
 
   const s = sessions.get(orgId);
-  if (!s) return res.status(404).json({ ok: false, error: "No session" });
+  if (!s) {
+    return res.status(404).json({ ok: false, error: "No session" });
+  }
 
   const chats = Array.from(s.chats.values()).sort(
     (a, b) => (b.lastMessageTimestamp || 0) - (a.lastMessageTimestamp || 0)
@@ -968,7 +981,11 @@ app.get("/wa/bootstrap", async (req: Request, res: Response) => {
 
   const contacts = Array.from(s.contacts.values());
 
-  res.json({ ok: true, chats: chats.slice(0, limit), contacts });
+  res.json({
+    ok: true,
+    chats: chats.slice(0, limit),
+    contacts,
+  });
 });
 
 // Avatar à la demande
@@ -993,7 +1010,9 @@ app.get("/wa/profile-picture", async (req: Request, res: Response) => {
 
 app.post("/wa/logout", async (req: Request, res: Response) => {
   const { orgId } = req.body || {};
-  if (!orgId) return res.status(400).json({ ok: false, error: "orgId required" });
+  if (!orgId) {
+    return res.status(400).json({ ok: false, error: "orgId required" });
+  }
 
   const id = String(orgId);
   const s = sessions.get(id);
@@ -1005,6 +1024,8 @@ app.post("/wa/logout", async (req: Request, res: Response) => {
   }
 
   sessions.delete(id);
+
+  // On supprime aussi l’auth disque pour forcer un nouveau QR au prochain login
   await clearSessionAuth(id);
 
   res.json({ ok: true });
@@ -1012,18 +1033,26 @@ app.post("/wa/logout", async (req: Request, res: Response) => {
 
 // ----------- ENVOI DE MESSAGES (OUTBOUND) + webhook
 
-app.post("/wa/send/text", requireGatewayAuth, async (req: Request, res: Response) => {
+app.post("/wa/send/text", async (req: Request, res: Response) => {
   const { orgId, to, text, quotedMsgId, mentions } = req.body || {};
   if (!orgId || !to || !text) {
-    return res.status(400).json({ ok: false, error: "orgId,to,text required" });
+    return res
+      .status(400)
+      .json({ ok: false, error: "orgId,to,text required" });
   }
 
   const s = getSessionOr404(String(orgId), res);
   if (!s) return;
 
   try {
-    const { sendJid, toPn, toLid } = await resolveRecipientJid(s.sock, String(to));
-    if (!sendJid) return res.status(400).json({ ok: false, error: "Invalid recipient" });
+    const { sendJid, toPn, toLid } = await resolveRecipientJid(
+      s.sock,
+      String(to)
+    );
+
+    if (!sendJid) {
+      return res.status(400).json({ ok: false, error: "Invalid recipient" });
+    }
 
     const options: any = {};
 
@@ -1035,10 +1064,13 @@ app.post("/wa/send/text", requireGatewayAuth, async (req: Request, res: Response
 
     const content: AnyMessageContent = { text: String(text) };
     if (Array.isArray(mentions) && mentions.length) {
-      (content as any).mentions = mentions.map((p: string) => normalizeToJid(p)).filter(Boolean);
+      (content as any).mentions = mentions
+        .map((p: string) => normalizeToJid(p))
+        .filter(Boolean);
     }
 
     const sent = await s.sock!.sendMessage(sendJid, content, options);
+    if (!sent) throw new Error("sendMessage returned undefined");
 
     void postWebhook("message.outgoing", String(orgId), {
       kind: "text",
@@ -1055,26 +1087,35 @@ app.post("/wa/send/text", requireGatewayAuth, async (req: Request, res: Response
   }
 });
 
-app.post("/wa/send/image", requireGatewayAuth, async (req: Request, res: Response) => {
+app.post("/wa/send/image", async (req: Request, res: Response) => {
   const { orgId, to, caption, image } = req.body || {};
   if (!orgId || !to || !image) {
-    return res.status(400).json({ ok: false, error: "orgId,to,image required" });
+    return res
+      .status(400)
+      .json({ ok: false, error: "orgId,to,image required" });
   }
 
   const s = getSessionOr404(String(orgId), res);
   if (!s) return;
 
   try {
-    const { sendJid, toPn, toLid } = await resolveRecipientJid(s.sock, String(to));
-    if (!sendJid) return res.status(400).json({ ok: false, error: "Invalid recipient" });
+    const { sendJid, toPn, toLid } = await resolveRecipientJid(
+      s.sock,
+      String(to)
+    );
+
+    if (!sendJid) {
+      return res.status(400).json({ ok: false, error: "Invalid recipient" });
+    }
 
     const buf = await bufferFromInput(image);
 
     const msg: AnyMessageContent = buf
-      ? { image: buf, caption }
-      : { image: { url: image.url }, caption };
+      ? { image: buf, caption: caption ? String(caption) : undefined }
+      : { image: { url: image.url }, caption: caption ? String(caption) : undefined };
 
     const sent = await s.sock!.sendMessage(sendJid, msg);
+    if (!sent) throw new Error("sendMessage returned undefined");
 
     void postWebhook("message.outgoing", String(orgId), {
       kind: "image",
@@ -1091,26 +1132,43 @@ app.post("/wa/send/image", requireGatewayAuth, async (req: Request, res: Respons
   }
 });
 
-app.post("/wa/send/document", requireGatewayAuth, async (req: Request, res: Response) => {
+app.post("/wa/send/document", async (req: Request, res: Response) => {
   const { orgId, to, fileName, mimetype, document } = req.body || {};
   if (!orgId || !to || !document) {
-    return res.status(400).json({ ok: false, error: "orgId,to,document required" });
+    return res
+      .status(400)
+      .json({ ok: false, error: "orgId,to,document required" });
   }
 
   const s = getSessionOr404(String(orgId), res);
   if (!s) return;
 
   try {
-    const { sendJid, toPn, toLid } = await resolveRecipientJid(s.sock, String(to));
-    if (!sendJid) return res.status(400).json({ ok: false, error: "Invalid recipient" });
+    const { sendJid, toPn, toLid } = await resolveRecipientJid(
+      s.sock,
+      String(to)
+    );
+
+    if (!sendJid) {
+      return res.status(400).json({ ok: false, error: "Invalid recipient" });
+    }
 
     const buf = await bufferFromInput(document);
 
     const msg: AnyMessageContent = buf
-      ? { document: buf, fileName: fileName || "file", mimetype }
-      : { document: { url: document.url }, fileName: fileName || "file", mimetype };
+      ? {
+          document: buf,
+          fileName: fileName || "file",
+          mimetype,
+        }
+      : {
+          document: { url: document.url },
+          fileName: fileName || "file",
+          mimetype,
+        };
 
     const sent = await s.sock!.sendMessage(sendJid, msg);
+    if (!sent) throw new Error("sendMessage returned undefined");
 
     void postWebhook("message.outgoing", String(orgId), {
       kind: "document",
@@ -1128,18 +1186,26 @@ app.post("/wa/send/document", requireGatewayAuth, async (req: Request, res: Resp
   }
 });
 
-app.post("/wa/send/audio", requireGatewayAuth, async (req: Request, res: Response) => {
+app.post("/wa/send/audio", async (req: Request, res: Response) => {
   const { orgId, to, ptt, audio } = req.body || {};
   if (!orgId || !to || !audio) {
-    return res.status(400).json({ ok: false, error: "orgId,to,audio required" });
+    return res
+      .status(400)
+      .json({ ok: false, error: "orgId,to,audio required" });
   }
 
   const s = getSessionOr404(String(orgId), res);
   if (!s) return;
 
   try {
-    const { sendJid, toPn, toLid } = await resolveRecipientJid(s.sock, String(to));
-    if (!sendJid) return res.status(400).json({ ok: false, error: "Invalid recipient" });
+    const { sendJid, toPn, toLid } = await resolveRecipientJid(
+      s.sock,
+      String(to)
+    );
+
+    if (!sendJid) {
+      return res.status(400).json({ ok: false, error: "Invalid recipient" });
+    }
 
     const buf = await bufferFromInput(audio);
 
@@ -1148,6 +1214,7 @@ app.post("/wa/send/audio", requireGatewayAuth, async (req: Request, res: Respons
       : { audio: { url: audio.url }, ptt: Boolean(ptt) };
 
     const sent = await s.sock!.sendMessage(sendJid, msg);
+    if (!sent) throw new Error("sendMessage returned undefined");
 
     void postWebhook("message.outgoing", String(orgId), {
       kind: "audio",
@@ -1164,31 +1231,43 @@ app.post("/wa/send/audio", requireGatewayAuth, async (req: Request, res: Respons
   }
 });
 
-app.post("/wa/send/buttons", requireGatewayAuth, async (req: Request, res: Response) => {
+app.post("/wa/send/buttons", async (req: Request, res: Response) => {
   const { orgId, to, text, footer, buttons } = req.body || {};
   if (!orgId || !to || !text || !Array.isArray(buttons)) {
-    return res.status(400).json({ ok: false, error: "orgId,to,text,buttons required" });
+    return res.status(400).json({
+      ok: false,
+      error: "orgId,to,text,buttons required",
+    });
   }
 
   const s = getSessionOr404(String(orgId), res);
   if (!s) return;
 
   try {
-    const { sendJid, toPn, toLid } = await resolveRecipientJid(s.sock, String(to));
-    if (!sendJid) return res.status(400).json({ ok: false, error: "Invalid recipient" });
+    const { sendJid, toPn, toLid } = await resolveRecipientJid(
+      s.sock,
+      String(to)
+    );
+
+    if (!sendJid) {
+      return res.status(400).json({ ok: false, error: "Invalid recipient" });
+    }
 
     const msg: AnyMessageContent = {
-      text,
-      footer,
+      text: String(text),
+      footer: footer ? String(footer) : undefined,
       buttons: buttons.map((b: any, i: number) => ({
         buttonId: String(b.id ?? `btn_${i + 1}`),
-        buttonText: { displayText: String(b.label ?? b.text ?? `Option ${i + 1}`) },
+        buttonText: {
+          displayText: String(b.label ?? b.text ?? `Option ${i + 1}`),
+        },
         type: 1,
       })),
       headerType: 1,
     } as any;
 
     const sent = await s.sock!.sendMessage(sendJid, msg);
+    if (!sent) throw new Error("sendMessage returned undefined");
 
     void postWebhook("message.outgoing", String(orgId), {
       kind: "buttons",
@@ -1196,7 +1275,7 @@ app.post("/wa/send/buttons", requireGatewayAuth, async (req: Request, res: Respo
       toPn,
       toLid,
       key: sent.key,
-      text,
+      text: String(text),
     });
 
     res.json({ ok: true, key: sent.key, to: sendJid, toPn, toLid });
@@ -1205,24 +1284,33 @@ app.post("/wa/send/buttons", requireGatewayAuth, async (req: Request, res: Respo
   }
 });
 
-app.post("/wa/send/list", requireGatewayAuth, async (req: Request, res: Response) => {
+app.post("/wa/send/list", async (req: Request, res: Response) => {
   const { orgId, to, title, text, footer, buttonText, sections } = req.body || {};
   if (!orgId || !to || !text || !Array.isArray(sections)) {
-    return res.status(400).json({ ok: false, error: "orgId,to,text,sections required" });
+    return res.status(400).json({
+      ok: false,
+      error: "orgId,to,text,sections required",
+    });
   }
 
   const s = getSessionOr404(String(orgId), res);
   if (!s) return;
 
   try {
-    const { sendJid, toPn, toLid } = await resolveRecipientJid(s.sock, String(to));
-    if (!sendJid) return res.status(400).json({ ok: false, error: "Invalid recipient" });
+    const { sendJid, toPn, toLid } = await resolveRecipientJid(
+      s.sock,
+      String(to)
+    );
+
+    if (!sendJid) {
+      return res.status(400).json({ ok: false, error: "Invalid recipient" });
+    }
 
     const msg: AnyMessageContent = {
-      text,
-      footer,
-      title,
-      buttonText: buttonText || "Choisir",
+      text: String(text),
+      footer: footer ? String(footer) : undefined,
+      title: title ? String(title) : undefined,
+      buttonText: buttonText ? String(buttonText) : "Choisir",
       sections: sections.map((sec: any) => ({
         title: String(sec.title || ""),
         rows: (sec.rows || []).map((r: any, i: number) => ({
@@ -1234,6 +1322,7 @@ app.post("/wa/send/list", requireGatewayAuth, async (req: Request, res: Response
     } as any;
 
     const sent = await s.sock!.sendMessage(sendJid, msg);
+    if (!sent) throw new Error("sendMessage returned undefined");
 
     void postWebhook("message.outgoing", String(orgId), {
       kind: "list",
@@ -1241,8 +1330,8 @@ app.post("/wa/send/list", requireGatewayAuth, async (req: Request, res: Response
       toPn,
       toLid,
       key: sent.key,
-      title,
-      text,
+      title: title || null,
+      text: String(text),
     });
 
     res.json({ ok: true, key: sent.key, to: sendJid, toPn, toLid });
@@ -1258,7 +1347,9 @@ app.get("/wa/messages/recent", (req: Request, res: Response) => {
   const limit = Number(req.query.limit || 50);
 
   const s = sessions.get(orgId);
-  if (!s) return res.status(404).json({ ok: false, error: "No session" });
+  if (!s) {
+    return res.status(404).json({ ok: false, error: "No session" });
+  }
 
   const out: any[] = [];
 
@@ -1275,26 +1366,35 @@ app.get("/wa/messages/recent", (req: Request, res: Response) => {
   });
 
   out.sort((a, b) => Number(b.timestamp) - Number(a.timestamp));
+
   res.json({ ok: true, messages: out.slice(0, limit) });
 });
 
 app.post("/wa/media/download", async (req: Request, res: Response) => {
   const { orgId, msgId } = req.body || {};
   if (!orgId || !msgId) {
-    return res.status(400).json({ ok: false, error: "orgId,msgId required" });
+    return res
+      .status(400)
+      .json({ ok: false, error: "orgId,msgId required" });
   }
 
   const s = getSessionOr404(String(orgId), res);
   if (!s) return;
 
   const msg = s.msgCache.get(String(msgId));
-  if (!msg) return res.status(404).json({ ok: false, error: "Message not in cache" });
+  if (!msg) {
+    return res
+      .status(404)
+      .json({ ok: false, error: "Message not in cache" });
+  }
 
   try {
-    const buffer = await downloadMediaMessage(msg, "buffer", {}, {
-      logger,
-      reuploadRequest: s.sock!.updateMediaMessage,
-    });
+    const buffer = await downloadMediaMessage(
+      msg,
+      "buffer",
+      {},
+      { logger, reuploadRequest: s.sock!.updateMediaMessage }
+    );
 
     const m =
       (msg.message as any)?.imageMessage?.mimetype ||
@@ -1304,7 +1404,7 @@ app.post("/wa/media/download", async (req: Request, res: Response) => {
       mimeLookup("bin") ||
       "application/octet-stream";
 
-    const base64 = (buffer as Buffer).toString("base64");
+    const base64 = buffer.toString("base64");
 
     res.json({
       ok: true,
@@ -1316,23 +1416,32 @@ app.post("/wa/media/download", async (req: Request, res: Response) => {
   }
 });
 
+// GET direct pour media (pour audioUrl / imageUrl style Z-API)
 app.get("/wa/media/:orgId/:msgId", async (req: Request, res: Response) => {
   const { orgId, msgId } = req.params;
   if (!orgId || !msgId) {
-    return res.status(400).json({ ok: false, error: "orgId,msgId required" });
+    return res
+      .status(400)
+      .json({ ok: false, error: "orgId,msgId required" });
   }
 
   const s = getSessionOr404(orgId, res);
   if (!s) return;
 
   const msg = s.msgCache.get(String(msgId));
-  if (!msg) return res.status(404).json({ ok: false, error: "Message not in cache" });
+  if (!msg) {
+    return res
+      .status(404)
+      .json({ ok: false, error: "Message not in cache" });
+  }
 
   try {
-    const buffer = await downloadMediaMessage(msg, "buffer", {}, {
-      logger,
-      reuploadRequest: s.sock!.updateMediaMessage,
-    });
+    const buffer = await downloadMediaMessage(
+      msg,
+      "buffer",
+      {},
+      { logger, reuploadRequest: s.sock!.updateMediaMessage }
+    );
 
     const m =
       (msg.message as any)?.imageMessage?.mimetype ||
@@ -1351,7 +1460,9 @@ app.get("/wa/media/:orgId/:msgId", async (req: Request, res: Response) => {
 
 // ----------- Health
 
-app.get("/health", (_req, res) => res.json({ ok: true, service: "zuria-baileys", ts: Date.now() }));
+app.get("/health", (_req, res) =>
+  res.json({ ok: true, service: "zuria-baileys", ts: Date.now() })
+);
 
 // ----------- Boot
 
