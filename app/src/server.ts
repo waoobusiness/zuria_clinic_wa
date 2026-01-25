@@ -40,12 +40,24 @@ const WEBHOOK_URL = process.env.WA_WEBHOOK_URL || process.env.WEBHOOK_URL || "";
 // 🌍 URL publique de la gateway (pour mediaUrl)
 const PUBLIC_URL = process.env.WA_PUBLIC_URL || process.env.PUBLIC_URL || "";
 
+// 🔐 (optionnel) Bearer pour protéger certains endpoints
+// Si vide, aucune auth n'est requise (comportement actuel inchangé)
+const GATEWAY_BEARER =
+  process.env.WA_GATEWAY_BEARER || process.env.GATEWAY_BEARER || "";
+
 // ----------- App
 
 const app = express();
 app.use(cors());
 app.use(express.json({ limit: "25mb" }));
 app.use(express.urlencoded({ extended: true, limit: "25mb" }));
+
+function requireBearerIfConfigured(req: Request, res: Response, next: () => void) {
+  if (!GATEWAY_BEARER) return next();
+  const auth = String(req.headers.authorization || "");
+  if (auth === `Bearer ${GATEWAY_BEARER}`) return next();
+  return res.status(401).json({ ok: false, error: "Unauthorized" });
+}
 
 // ----------- Types & Stores
 
@@ -1045,6 +1057,27 @@ app.post("/wa/logout", async (req: Request, res: Response) => {
   await clearSessionAuth(id);
 
   res.json({ ok: true });
+});
+
+// ----------- LID RESOLVER (NEW)
+// Résout PN -> LID (best effort) sans envoyer de message.
+// Protégé par Bearer si WA_GATEWAY_BEARER est configuré.
+
+app.post("/wa/resolve", requireBearerIfConfigured, async (req: Request, res: Response) => {
+  const { orgId, to } = req.body || {};
+  if (!orgId || !to) {
+    return res.status(400).json({ ok: false, error: "orgId,to required" });
+  }
+
+  const s = getSessionOr404(String(orgId), res);
+  if (!s) return;
+
+  try {
+    const { sendJid, toPn, toLid } = await resolveRecipientJid(s.sock, String(to));
+    return res.json({ ok: true, sendJid, toPn, toLid });
+  } catch (err) {
+    return res.status(500).json({ ok: false, error: String(err) });
+  }
 });
 
 // ----------- ENVOI DE MESSAGES (OUTBOUND) + webhook
