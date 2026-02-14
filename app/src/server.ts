@@ -7,7 +7,7 @@ import fs from "fs-extra";
 import path from "path";
 import { LRUCache } from "lru-cache";
 import { lookup as mimeLookup } from "mime-types";
-import { EventEmitter } from "events"; // ✅ Node core EventEmitter
+import { EventEmitter } from "events";
 import QRCode from "qrcode";
 
 // Baileys
@@ -28,17 +28,20 @@ const logger = pino({ level: process.env.LOG_LEVEL || "info" });
 
 const PORT = Number(process.env.PORT || 3000);
 
-// ✅ On prend d’abord SESSIONS_DIR, sinon DATA_DIR, sinon ./sessions
+// On prend d'abord SESSIONS_DIR, sinon DATA_DIR, sinon ./sessions
 const SESSIONS_DIR =
   process.env.SESSIONS_DIR ||
   process.env.DATA_DIR ||
   path.join(process.cwd(), "sessions");
 
-// 🔄 Webhook (Make / Supabase / autre)
+// Webhook (Make / Supabase / autre)
 const WEBHOOK_URL = process.env.WA_WEBHOOK_URL || process.env.WEBHOOK_URL || "";
 
-// 🌍 URL publique de la gateway (pour mediaUrl)
+// URL publique de la gateway (pour mediaUrl)
 const PUBLIC_URL = process.env.WA_PUBLIC_URL || process.env.PUBLIC_URL || "";
+
+// Option: stocker raw contact en mémoire (peut coûter cher en RAM)
+const STORE_RAW_CONTACT = process.env.WA_STORE_RAW_CONTACT === "1";
 
 // ----------- App
 
@@ -65,8 +68,8 @@ type ContactSummary = {
   name?: string;
   notify?: string;
   shortName?: string;
-  phone?: string | null; // ✅ numéro normalisé si dispo (waid, etc.)
-  raw?: any; // ✅ on garde le brut au cas où tu veuilles debugger
+  phone?: string | null; // numéro normalisé si dispo (waid, etc.)
+  raw?: any; // seulement si WA_STORE_RAW_CONTACT=1
 };
 
 type Session = {
@@ -79,6 +82,13 @@ type Session = {
   msgCache: LRUCache<string, WAMessage>;
   chats: Map<string, ChatSummary>;
   contacts: Map<string, ContactSummary>;
+
+  // Anti-storm / anti-OOM
+  startPromise?: Promise<Session> | null;
+  reconnectTimer?: NodeJS.Timeout | null;
+  reconnectFailCount: number;
+  lastKnownPhone: string | null; // digits E.164 sans +
+  stableSessionId: string | null; // wa_${orgId}_${phoneDigits}
 };
 
 const sessions = new Map<string, Session>();
@@ -89,9 +99,16 @@ function createEmptySession(orgId: string): Session {
     bus: new EventEmitter(),
     status: "closed",
     qr: null,
-    msgCache: new LRUCache({ max: 1000 }),
+    // baisse un peu la cache pour limiter la RAM en cas de storm
+    msgCache: new LRUCache({ max: 200 }),
     chats: new Map(),
     contacts: new Map(),
+
+    startPromise: null,
+    reconnectTimer: null,
+    reconnectFailCount: 0,
+    lastKnownPhone: null,
+    stableSessionId: null,
   };
 }
 
@@ -105,13 +122,13 @@ function getBus(orgId: string): EventEmitter {
 }
 
 function phoneToJid(to: string): string {
-  // ✅ Si c'est déjà un JID complet (@lid, @s.whatsapp.net, @g.us, etc.), on le garde tel quel
+  // Si c'est déjà un JID complet (@lid, @s.whatsapp.net, @g.us, etc.), on le garde tel quel
   if (to.includes("@")) return to;
   const digits = to.replace(/[^\d]/g, "").replace(/^00/, "");
   return `${digits}@s.whatsapp.net`;
 }
 
-// ✅ Helper: PN JID -> LID JID (best-effort)
+// Helper PN JID -> LID JID (best-effort)
 async function getLidForPnJid(sock: any, pnJid: string): Promise<string | null> {
   const lidStore = sock?.signalRepository?.lidMapping;
   if (!lidStore || typeof lidStore.getLIDForPN !== "function") return null;
@@ -170,9 +187,42 @@ async function clearSessionAuth(orgId: string) {
   }
 }
 
+// ----------- Anti-storm helpers
+
+function computeBackoffMs(failCount: number) {
+  // 30s, 60s, 120s, 240s, 300s max + jitter
+  const base = Math.min(Math.pow(2, failCount + 1) * 15_000, 300_000);
+  const jitter = Math.floor(Math.random() * 10_000);
+  return base + jitter;
+}
+
+async function destroySock(sess: Session, reason: string) {
+  const sock: any = sess.sock;
+  if (!sock) return;
+
+  try {
+    sock.ev?.removeAllListeners?.();
+  } catch {}
+
+  try {
+    sock.ws?.removeAllListeners?.();
+  } catch {}
+
+  try {
+    sock.end?.(new Error(reason));
+  } catch {}
+
+  try {
+    sock.ws?.close?.();
+  } catch {}
+
+  sess.sock = undefined;
+  sess.saveCreds = undefined;
+}
+
 // ----------- Helpers divers
 
-// ✅ NOUVELLE VERSION : on NE considère pas @lid, @g.us, status, etc. comme des numéros de téléphone
+// NOUVELLE VERSION : on NE considère pas @lid, @g.us, status, etc. comme des numéros de téléphone
 function jidToPhone(jid?: string | null): string | null {
   if (!jid) return null;
 
@@ -228,7 +278,11 @@ function extractMessageBody(msg: WAMessage): string | undefined {
 
 // ----------- Helper: envoyer vers le webhook externe
 
-async function postWebhook(event: string, orgId: string, payload: any): Promise<void> {
+async function postWebhook(
+  event: string,
+  orgId: string,
+  payload: any
+): Promise<void> {
   if (!WEBHOOK_URL) return;
 
   try {
@@ -280,7 +334,7 @@ function buildZapiLikeMessage(msg: WAMessage, sess: Session, orgId: string): any
     instanceId: orgId,
     messageId: msg.key.id,
 
-    // ✅ champs utiles pour wa-webhook
+    // champs utiles pour wa-webhook
     remoteJid: remoteJid || null,
     chatId: remoteJid || null,
     phone: contactPhone,
@@ -297,7 +351,7 @@ function buildZapiLikeMessage(msg: WAMessage, sess: Session, orgId: string): any
     type: "ReceivedCallback",
     fromApi: false,
 
-    // ✅ Nouveau: bloc contact complet
+    // Nouveau: bloc contact complet
     contact: contact
       ? {
           id: contact.id,
@@ -410,7 +464,7 @@ function normalizeContact(raw: any): ContactSummary | null {
   const notify = raw.notify;
   const shortName = raw.shortName || raw.name || raw.pushName || raw.verifiedName || name;
 
-  // ✅ Tentative "best-effort" pour récupérer le numéro
+  // Tentative best-effort pour récupérer le numéro
   let phone: string | null = null;
 
   if (typeof raw.waid === "string") {
@@ -430,269 +484,344 @@ function normalizeContact(raw: any): ContactSummary | null {
 
   if (!phone) phone = jidToPhone(id);
 
-  return { id, name, notify, shortName, phone, raw };
+  return { id, name, notify, shortName, phone, raw: STORE_RAW_CONTACT ? raw : undefined };
 }
 
 // ----------- Session bootstrap
 
+let cachedBaileysVersion: any = null;
+let cachedBaileysVersionAt = 0;
+
+async function getBaileysVersionCached() {
+  const now = Date.now();
+  if (cachedBaileysVersion && now - cachedBaileysVersionAt < 10 * 60_000) {
+    return cachedBaileysVersion;
+  }
+  const r = await fetchLatestBaileysVersion();
+  cachedBaileysVersion = r.version;
+  cachedBaileysVersionAt = now;
+  return cachedBaileysVersion;
+}
+
 async function startSession(orgId: string): Promise<Session> {
   let sess = sessions.get(orgId);
 
-  // Si déjà connecté, on renvoie
-  if (sess?.sock && sess.status === "connected") {
+  if (!sess) {
+    sess = createEmptySession(orgId);
+    sessions.set(orgId, sess);
+  }
+
+  // Mutex: si un start est déjà en cours, renvoyer le même
+  if (sess.startPromise) return sess.startPromise;
+
+  // Si une socket existe déjà et que la session n'est pas closed, ne pas recréer
+  if (sess.sock && ["starting", "qr", "connecting", "connected"].includes(sess.status)) {
     return sess;
   }
 
-  const authDir = path.join(SESSIONS_DIR, orgId);
-  await fs.ensureDir(authDir);
+  sess.status = "starting";
 
-  const { state, saveCreds } = await useMultiFileAuthState(authDir);
-  const { version } = await fetchLatestBaileysVersion();
+  sess.startPromise = (async () => {
+    // Safety: si une ancienne sock traîne, on la détruit avant de recréer
+    if (sess!.sock) await destroySock(sess!, "restart_before_start");
 
-  if (!sess) sess = createEmptySession(orgId);
-  sessions.set(orgId, sess);
+    const authDir = path.join(SESSIONS_DIR, orgId);
+    await fs.ensureDir(authDir);
 
-  const sock = makeWASocket({
-    version,
-    printQRInTerminal: false,
-    auth: {
-      creds: state.creds,
-      keys: makeCacheableSignalKeyStore(state.keys, logger),
-    },
-    browser: ["Zuria", "Chrome", "1.0.0"],
-    logger,
-    syncFullHistory: false,
-    markOnlineOnConnect: false,
-  });
+    const { state, saveCreds } = await useMultiFileAuthState(authDir);
+    const version = await getBaileysVersionCached();
 
-  sess.sock = sock;
-  sess.saveCreds = saveCreds;
-  sess.status = "connecting";
-  sess.qr = null;
-
-  // Sauvegarde des creds
-  sock.ev.on("creds.update", saveCreds);
-
-  // Événements de connexion
-  sock.ev.on("connection.update", (u: any) => {
-    const { connection, lastDisconnect, qr } = u;
-
-    if (qr) {
-      sess!.qr = qr;
-      sess!.status = "qr";
-      getBus(orgId).emit("status", { type: "qr", qr });
-    }
-
-    if (connection === "open") {
-      sess!.status = "connected";
-      sess!.qr = null;
-      getBus(orgId).emit("status", { type: "connected", user: sock.user });
-      logger.info({ orgId }, "WA connected");
-
-      void postWebhook("connection.open", orgId, { user: sock.user });
-      return;
-    }
-
-    if (connection === "close") {
-      const code: number = (lastDisconnect as any)?.error?.output?.statusCode ?? 0;
-
-      const fatalCodes: number[] = [
-        DisconnectReason.loggedOut,
-        DisconnectReason.forbidden,
-        DisconnectReason.badSession,
-        DisconnectReason.connectionReplaced,
-      ];
-
-      const willReconnect = !fatalCodes.includes(code);
-
-      sess!.status = "closed";
-      getBus(orgId).emit("status", { type: "closed", code, willReconnect });
-
-      logger.warn({ orgId, code, willReconnect }, "WA closed");
-      void postWebhook("connection.close", orgId, { code, willReconnect });
-
-      if (!willReconnect) {
-        sessions.delete(orgId);
-        clearSessionAuth(orgId).catch(() => {});
-      } else {
-        setTimeout(() => {
-          logger.info({ orgId, code }, "auto-restart WA session");
-          startSession(orgId).catch((err) =>
-            logger.error({ err, orgId }, "failed to restart session")
-          );
-        }, 1000);
-      }
-    }
-  });
-
-  // Historique initial (chats, contacts, messages)
-  sock.ev.on("messaging-history.set", (payload: any) => {
-    const { chats, contacts, messages, syncType } = payload || {};
-
-    if (Array.isArray(chats)) {
-      for (const c of chats) {
-        const summary = normalizeChat(c);
-        if (summary) sess!.chats.set(summary.id, summary);
-      }
-    }
-
-    if (Array.isArray(contacts)) {
-      for (const c of contacts) {
-        const summary = normalizeContact(c);
-        if (summary) sess!.contacts.set(summary.id, summary);
-      }
-    }
-
-    if (Array.isArray(messages)) {
-      for (const msg of messages as WAMessage[]) {
-        if (msg.key && msg.key.id) sess!.msgCache.set(msg.key.id, msg);
-      }
-    }
-
-    getBus(orgId).emit("history", {
-      type: "set",
-      syncType,
-      chats: Array.from(sess!.chats.values()),
-      contacts: Array.from(sess!.contacts.values()),
+    const sock = makeWASocket({
+      version,
+      printQRInTerminal: false,
+      auth: {
+        creds: state.creds,
+        keys: makeCacheableSignalKeyStore(state.keys, logger),
+      },
+      browser: ["Zuria", "Chrome", "1.0.0"],
+      logger,
+      syncFullHistory: false,
+      markOnlineOnConnect: false,
     });
-  });
 
-  // Chats & contacts live updates
-  sock.ev.on("chats.upsert", (up: any) => {
-    const arr = Array.isArray(up) ? up : up?.chats || [];
-    const updated: ChatSummary[] = [];
+    sess!.sock = sock;
+    sess!.saveCreds = saveCreds;
+    sess!.status = "connecting";
+    sess!.qr = null;
 
-    for (const c of arr) {
-      const summary = normalizeChat(c);
-      if (summary) {
-        sess!.chats.set(summary.id, summary);
-        updated.push(summary);
+    // Sauvegarde des creds
+    sock.ev.on("creds.update", saveCreds);
+
+    // Événements de connexion
+    sock.ev.on("connection.update", (u: any) => {
+      const { connection, lastDisconnect, qr } = u;
+
+      if (qr) {
+        sess!.qr = qr;
+        sess!.status = "qr";
+        getBus(orgId).emit("status", { type: "qr", qr });
       }
-    }
 
-    if (updated.length) getBus(orgId).emit("chats", { type: "upsert", chats: updated });
-  });
+      if (connection === "open") {
+        sess!.status = "connected";
+        sess!.qr = null;
 
-  sock.ev.on("chats.update", (updates: any) => {
-    const updated: ChatSummary[] = [];
+        // reset backoff + cancel timer
+        sess!.reconnectFailCount = 0;
+        if (sess!.reconnectTimer) {
+          clearTimeout(sess!.reconnectTimer);
+          sess!.reconnectTimer = null;
+        }
 
-    for (const u of updates || []) {
-      const id = u.id as string;
-      const existing = sess!.chats.get(id) || ({ id } as ChatSummary);
+        const phoneDigits = getConnectedPhone(sess!) || null;
+        sess!.lastKnownPhone = phoneDigits;
+        sess!.stableSessionId = phoneDigits ? `wa_${orgId}_${phoneDigits}` : null;
 
-      const merged: ChatSummary = {
-        ...existing,
-        unreadCount: u.unreadCount !== undefined ? u.unreadCount : existing.unreadCount,
-        lastMessageTimestamp:
-          u.conversationTimestamp !== undefined
-            ? Number(u.conversationTimestamp)
-            : existing.lastMessageTimestamp,
-      };
+        getBus(orgId).emit("status", { type: "connected", user: sock.user });
+        logger.info({ orgId, phoneDigits }, "WA connected");
 
-      if (u.name || u.subject) merged.name = u.name || u.subject;
-
-      sess!.chats.set(id, merged);
-      updated.push(merged);
-    }
-
-    if (updated.length) getBus(orgId).emit("chats", { type: "update", chats: updated });
-  });
-
-  sock.ev.on("contacts.upsert", (up: any) => {
-    const arr = Array.isArray(up) ? up : up?.contacts || [];
-    const updated: ContactSummary[] = [];
-
-    for (const c of arr) {
-      const summary = normalizeContact(c);
-      if (summary) {
-        sess!.contacts.set(summary.id, summary);
-        updated.push(summary);
+        void postWebhook("connection.open", orgId, {
+          user: sock.user,
+          phone: phoneDigits,
+          sessionId: sess!.stableSessionId,
+        });
+        return;
       }
-    }
 
-    if (updated.length) getBus(orgId).emit("contacts", { type: "upsert", contacts: updated });
-  });
+      if (connection === "close") {
+        const code: number = (lastDisconnect as any)?.error?.output?.statusCode ?? 0;
 
-  sock.ev.on("contacts.update", (updates: any) => {
-    const updated: ContactSummary[] = [];
+        // Ces codes doivent stopper la reconnexion automatique
+        // Important: on évite de clear auth sauf logout/badSession
+        const fatalCodes: number[] = [
+          DisconnectReason.loggedOut,
+          DisconnectReason.badSession,
+          DisconnectReason.forbidden,
+          DisconnectReason.connectionReplaced,
+        ];
 
-    for (const u of updates || []) {
-      const id = u.id as string;
-      const existing = sess!.contacts.get(id) || ({ id } as ContactSummary);
+        const willReconnect = !fatalCodes.includes(code);
 
-      const merged: ContactSummary = {
-        ...existing,
-        name: u.name || u.notify || existing.name,
-        notify: u.notify ?? existing.notify,
-        shortName: u.shortName ?? existing.shortName,
-        phone:
-          existing.phone ??
-          (typeof u.waid === "string" ? u.waid.replace(/[^\d]/g, "") : existing.phone),
-        raw: existing.raw ?? u,
-      };
+        sess!.status = "closed";
+        getBus(orgId).emit("status", { type: "closed", code, willReconnect });
 
-      sess!.contacts.set(id, merged);
-      updated.push(merged);
-    }
+        logger.warn({ orgId, code, willReconnect }, "WA closed");
 
-    if (updated.length) getBus(orgId).emit("contacts", { type: "update", contacts: updated });
-  });
+        void postWebhook("connection.close", orgId, {
+          code,
+          willReconnect,
+          phone: sess!.lastKnownPhone,
+          sessionId: sess!.stableSessionId,
+          user: sock.user || null,
+        });
 
-  // Messages entrants => cache + bus + webhook (INBOUND uniquement)
-  sock.ev.on("messages.upsert", (m: any) => {
-    const up = m.messages || [];
-    for (const msg of up as WAMessage[]) {
-      if (msg.key && msg.key.id) sess!.msgCache.set(msg.key.id, msg);
+        // Nettoie la sock pour éviter fuite mémoire
+        void destroySock(sess!, `closed_${code}`);
 
-      const messageType = msg.message ? Object.keys(msg.message)[0] : undefined;
-      const body = extractMessageBody(msg);
+        if (!willReconnect) {
+          // clear auth seulement si vrai logout/bad session
+          if (code === DisconnectReason.loggedOut || code === DisconnectReason.badSession) {
+            clearSessionAuth(orgId).catch(() => {});
+          }
 
-      const remoteJid = msg.key.remoteJid as string | undefined;
-      const phoneFromJid = jidToPhone(remoteJid || "");
-      const contact =
-        (remoteJid && sess!.contacts.get(remoteJid)) ||
-        (phoneFromJid ? sess!.contacts.get(`${phoneFromJid}@s.whatsapp.net`) : undefined);
-      const contactPhone = contact?.phone ?? phoneFromJid ?? null;
-      const contactName =
-        contact?.name || contact?.shortName || (msg as any).pushName || contactPhone || remoteJid;
+          // stop
+          return;
+        }
 
-      const simplified = {
-        id: msg.key.id,
-        from: remoteJid,
-        fromMe: msg.key.fromMe,
-        pushName: (msg as any).pushName,
-        timestamp: (msg.messageTimestamp || 0).toString(),
-        messageType,
-        body,
-        contact: {
-          id: remoteJid || null,
-          name: contactName || null,
-          phone: contactPhone,
-        },
-      };
-
-      // 🔴 SSE pour Lovable (UI)
-      getBus(orgId).emit("message", { type: "message", message: simplified });
-
-      // 🔔 Webhook Supabase (INBOUND)
-      if (!msg.key.fromMe) {
-        const zmsg = buildZapiLikeMessage(msg, sess!, orgId);
-        void postWebhook("message.incoming", orgId, { ...simplified, zapi: zmsg });
+        // schedule reconnect avec backoff, et un seul timer max
+        if (!sess!.reconnectTimer) {
+          const delay = computeBackoffMs(sess!.reconnectFailCount++);
+          sess!.reconnectTimer = setTimeout(() => {
+            sess!.reconnectTimer = null;
+            logger.info({ orgId, code, delay }, "auto-restart WA session (backoff)");
+            startSession(orgId).catch((err) =>
+              logger.error({ err, orgId }, "failed to restart session")
+            );
+          }, delay);
+        }
       }
-    }
-  });
+    });
 
-  sock.ev.on("messages.update", (updates: any) => {
-    getBus(orgId).emit("messages.update", updates);
-    void postWebhook("messages.update", orgId, updates);
-  });
+    // Historique initial (chats, contacts, messages)
+    sock.ev.on("messaging-history.set", (payload: any) => {
+      const { chats, contacts, messages, syncType } = payload || {};
 
-  sock.ev.on("message-receipt.update", (r: any) => {
-    getBus(orgId).emit("receipt", r);
-    void postWebhook("message-receipt.update", orgId, r);
-  });
+      if (Array.isArray(chats)) {
+        for (const c of chats) {
+          const summary = normalizeChat(c);
+          if (summary) sess!.chats.set(summary.id, summary);
+        }
+      }
 
-  return sess;
+      if (Array.isArray(contacts)) {
+        for (const c of contacts) {
+          const summary = normalizeContact(c);
+          if (summary) sess!.contacts.set(summary.id, summary);
+        }
+      }
+
+      if (Array.isArray(messages)) {
+        for (const msg of messages as WAMessage[]) {
+          if (msg.key && msg.key.id) sess!.msgCache.set(msg.key.id, msg);
+        }
+      }
+
+      getBus(orgId).emit("history", {
+        type: "set",
+        syncType,
+        chats: Array.from(sess!.chats.values()),
+        contacts: Array.from(sess!.contacts.values()),
+      });
+    });
+
+    // Chats & contacts live updates
+    sock.ev.on("chats.upsert", (up: any) => {
+      const arr = Array.isArray(up) ? up : up?.chats || [];
+      const updated: ChatSummary[] = [];
+
+      for (const c of arr) {
+        const summary = normalizeChat(c);
+        if (summary) {
+          sess!.chats.set(summary.id, summary);
+          updated.push(summary);
+        }
+      }
+
+      if (updated.length) getBus(orgId).emit("chats", { type: "upsert", chats: updated });
+    });
+
+    sock.ev.on("chats.update", (updates: any) => {
+      const updated: ChatSummary[] = [];
+
+      for (const u of updates || []) {
+        const id = u.id as string;
+        const existing = sess!.chats.get(id) || ({ id } as ChatSummary);
+
+        const merged: ChatSummary = {
+          ...existing,
+          unreadCount: u.unreadCount !== undefined ? u.unreadCount : existing.unreadCount,
+          lastMessageTimestamp:
+            u.conversationTimestamp !== undefined
+              ? Number(u.conversationTimestamp)
+              : existing.lastMessageTimestamp,
+        };
+
+        if (u.name || u.subject) merged.name = u.name || u.subject;
+
+        sess!.chats.set(id, merged);
+        updated.push(merged);
+      }
+
+      if (updated.length) getBus(orgId).emit("chats", { type: "update", chats: updated });
+    });
+
+    sock.ev.on("contacts.upsert", (up: any) => {
+      const arr = Array.isArray(up) ? up : up?.contacts || [];
+      const updated: ContactSummary[] = [];
+
+      for (const c of arr) {
+        const summary = normalizeContact(c);
+        if (summary) {
+          sess!.contacts.set(summary.id, summary);
+          updated.push(summary);
+        }
+      }
+
+      if (updated.length) getBus(orgId).emit("contacts", { type: "upsert", contacts: updated });
+    });
+
+    sock.ev.on("contacts.update", (updates: any) => {
+      const updated: ContactSummary[] = [];
+
+      for (const u of updates || []) {
+        const id = u.id as string;
+        const existing = sess!.contacts.get(id) || ({ id } as ContactSummary);
+
+        const merged: ContactSummary = {
+          ...existing,
+          name: u.name || u.notify || existing.name,
+          notify: u.notify ?? existing.notify,
+          shortName: u.shortName ?? existing.shortName,
+          phone:
+            existing.phone ??
+            (typeof u.waid === "string" ? u.waid.replace(/[^\d]/g, "") : existing.phone),
+          raw: existing.raw ?? (STORE_RAW_CONTACT ? u : undefined),
+        };
+
+        sess!.contacts.set(id, merged);
+        updated.push(merged);
+      }
+
+      if (updated.length) getBus(orgId).emit("contacts", { type: "update", contacts: updated });
+    });
+
+    // Messages entrants => cache + bus + webhook (INBOUND uniquement)
+    sock.ev.on("messages.upsert", (m: any) => {
+      const up = m.messages || [];
+      for (const msg of up as WAMessage[]) {
+        if (msg.key && msg.key.id) sess!.msgCache.set(msg.key.id, msg);
+
+        const messageType = msg.message ? Object.keys(msg.message)[0] : undefined;
+        const body = extractMessageBody(msg);
+
+        const remoteJid = msg.key.remoteJid as string | undefined;
+        const phoneFromJid = jidToPhone(remoteJid || "");
+        const contact =
+          (remoteJid && sess!.contacts.get(remoteJid)) ||
+          (phoneFromJid ? sess!.contacts.get(`${phoneFromJid}@s.whatsapp.net`) : undefined);
+        const contactPhone = contact?.phone ?? phoneFromJid ?? null;
+        const contactName =
+          contact?.name || contact?.shortName || (msg as any).pushName || contactPhone || remoteJid;
+
+        const simplified = {
+          id: msg.key.id,
+          from: remoteJid,
+          fromMe: msg.key.fromMe,
+          pushName: (msg as any).pushName,
+          timestamp: (msg.messageTimestamp || 0).toString(),
+          messageType,
+          body,
+          contact: {
+            id: remoteJid || null,
+            name: contactName || null,
+            phone: contactPhone,
+          },
+        };
+
+        // SSE pour Lovable (UI)
+        getBus(orgId).emit("message", { type: "message", message: simplified });
+
+        // Webhook Supabase (INBOUND)
+        if (!msg.key.fromMe) {
+          const zmsg = buildZapiLikeMessage(msg, sess!, orgId);
+          void postWebhook("message.incoming", orgId, { ...simplified, zapi: zmsg });
+        }
+      }
+    });
+
+    sock.ev.on("messages.update", (updates: any) => {
+      getBus(orgId).emit("messages.update", updates);
+      void postWebhook("messages.update", orgId, updates);
+    });
+
+    sock.ev.on("message-receipt.update", (r: any) => {
+      getBus(orgId).emit("receipt", r);
+      void postWebhook("message-receipt.update", orgId, r);
+    });
+
+    return sess!;
+  })();
+
+  try {
+    return await sess.startPromise;
+  } catch (err) {
+    // si start échoue, remettre état safe
+    sess.status = "closed";
+    throw err;
+  } finally {
+    // libérer le mutex start même si erreur
+    sess.startPromise = null;
+  }
 }
 
 // ----------- SSE (événements temps réel)
@@ -803,7 +932,7 @@ app.get("/wa/status", async (req: Request, res: Response) => {
   });
 });
 
-// ✅ AJOUT: endpoint utilisé par l'edge function wa-resolve
+// Endpoint utilisé par l'edge function wa-resolve
 app.post("/wa/resolve", async (req: Request, res: Response) => {
   const { orgId, to, peer, phone } = req.body || {};
   const input = String(to || peer || phone || "").trim();
@@ -876,7 +1005,7 @@ app.get("/wa/qr", async (req: Request, res: Response) => {
   res.json({ ok: true, qr: s.qr, svg });
 });
 
-// ➕ Bootstrap : renvoyer les dernières conversations + contacts
+// Bootstrap : renvoyer les dernières conversations + contacts
 app.get("/wa/bootstrap", async (req: Request, res: Response) => {
   const orgId = String(req.query.orgId || "");
   const limit = Number(req.query.limit || 20);
@@ -895,7 +1024,7 @@ app.get("/wa/bootstrap", async (req: Request, res: Response) => {
   res.json({ ok: true, chats: chats.slice(0, limit), contacts });
 });
 
-// ➕ Avatar à la demande
+// Avatar à la demande
 app.get("/wa/profile-picture", async (req: Request, res: Response) => {
   const orgId = String(req.query.orgId || "");
   const jid = String(req.query.jid || "");
@@ -926,6 +1055,11 @@ app.post("/wa/logout", async (req: Request, res: Response) => {
     await s?.sock?.logout();
   } catch (e) {
     logger.warn({ e, orgId: id }, "logout error (ignored)");
+  }
+
+  if (s?.reconnectTimer) {
+    clearTimeout(s.reconnectTimer);
+    s.reconnectTimer = null;
   }
 
   sessions.delete(id);
@@ -1218,7 +1352,7 @@ app.post("/wa/media/download", async (req: Request, res: Response) => {
       mimeLookup("bin") ||
       "application/octet-stream";
 
-    const base64 = buffer.toString("base64");
+    const base64 = (buffer as Buffer).toString("base64");
 
     res.json({
       ok: true,
@@ -1230,7 +1364,7 @@ app.post("/wa/media/download", async (req: Request, res: Response) => {
   }
 });
 
-// ➕ GET direct pour media (pour audioUrl / imageUrl style Z-API)
+// GET direct pour media (pour audioUrl / imageUrl style Z-API)
 app.get("/wa/media/:orgId/:msgId", async (req: Request, res: Response) => {
   const { orgId, msgId } = req.params;
   if (!orgId || !msgId) {
