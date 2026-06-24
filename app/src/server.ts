@@ -711,7 +711,21 @@ async function startSession(orgId: string): Promise<Session> {
         if (!msg.key.fromMe) {
           const zmsg = buildZapiLikeMessage(msg, sess!, orgId);
           void postWebhook("message.incoming", orgId, { ...simplified, zapi: zmsg });
-        }
+        } else {
+        // Messages envoyés depuis le téléphone directement (pas via l'API CRM)
+        const zmsg = buildZapiLikeMessage(msg, sess!, orgId);
+        void postWebhook("message.outgoing", orgId, {
+          ...simplified,
+          kind: messageType === "audioMessage" ? "audio"
+              : messageType === "imageMessage"  ? "image"
+              : messageType === "videoMessage"  ? "video"
+              : messageType === "documentMessage" ? "document" : "text",
+          to: remoteJid,
+          key: msg.key,
+          body,
+          zapi: zmsg,
+        });
+      }
       }
     });
 
