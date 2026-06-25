@@ -586,12 +586,17 @@ async function startSession(orgId: string): Promise<Session> {
         }
       }
 
-      // ON_DEMAND history (syncType === 3): forward messages to webhook → Supabase
-      if (syncType === 3 && Array.isArray(messages) && messages.length) {
+      // Forward ALL history messages to webhook → Supabase (syncType 2=initial, 3=ON_DEMAND)
+      // Supabase webhook handles deduplication via message_id unique constraint
+      logger.info({ orgId, syncType, msgCount: Array.isArray(messages) ? messages.length : 0 }, "messaging-history.set received");
+      if (Array.isArray(messages) && messages.length) {
         for (const msg of messages as WAMessage[]) {
           if (!msg.key?.id) continue;
           const remoteJid = msg.key.remoteJid as string | undefined;
-          const phone = jidToPhone(remoteJid || "");
+          if (!remoteJid) continue;
+          // Skip status and broadcast
+          if (remoteJid === "status@broadcast" || remoteJid.includes("newsletter")) continue;
+          const phone = jidToPhone(remoteJid);
           const simplified = {
             id: msg.key.id,
             from: remoteJid,
@@ -601,8 +606,9 @@ async function startSession(orgId: string): Promise<Session> {
             messageType: msg.message ? Object.keys(msg.message)[0] : undefined,
             body: extractMessageBody(msg),
             phone,
-            isGroup: (remoteJid || "").endsWith("@g.us"),
+            isGroup: remoteJid.endsWith("@g.us"),
             isHistory: true,
+            syncType,
           };
           const zmsg = buildZapiLikeMessage(msg, sess!, orgId);
           void postWebhook("message.incoming", orgId, { ...simplified, zapi: zmsg });
