@@ -586,7 +586,7 @@ async function startSession(orgId: string): Promise<Session> {
     }
   });
 
-  sock.ev.on("messaging-history.set", (payload: any) => {
+  sock.ev.on("messaging-history.set", async (payload: any) => {
     const { chats, contacts, messages, syncType } = payload || {};
 
     if (Array.isArray(chats)) {
@@ -606,6 +606,33 @@ async function startSession(orgId: string): Promise<Session> {
     if (Array.isArray(messages)) {
       for (const msg of messages as WAMessage[]) {
         if (msg.key && msg.key.id) sess!.msgCache.set(msg.key.id, msg);
+      }
+    }
+
+    // ON_DEMAND history (syncType === 3): forward messages to webhook → Supabase
+    if (syncType === 3 && Array.isArray(messages) && messages.length) {
+      for (const msg of messages as WAMessage[]) {
+        if (!msg.key?.id) continue;
+        sess!.msgCache.set(msg.key.id, msg);
+        const key: any = msg.key || {};
+        const remoteJid = key.remoteJid as string | undefined;
+        const isLidChat = (remoteJid || "").endsWith("@lid");
+        let phone: string | null = null;
+        if (remoteJid && !isLidChat) phone = jidToPhone(remoteJid);
+        const simplified = {
+          id: msg.key.id,
+          from: remoteJid,
+          fromMe: !!msg.key.fromMe,
+          pushName: (msg as any).pushName,
+          timestamp: (msg.messageTimestamp || 0).toString(),
+          messageType: msg.message ? Object.keys(msg.message)[0] : undefined,
+          body: extractMessageBody(msg),
+          phone,
+          isGroup: (remoteJid || "").endsWith("@g.us"),
+          isHistory: true,
+        };
+        const zmsg = await buildZapiLikeMessage(msg, sess!, orgId);
+        void postWebhook("message.incoming", orgId, { ...simplified, zapi: zmsg });
       }
     }
 
@@ -1345,6 +1372,49 @@ app.get("/wa/media/:orgId/:msgId", async (req: Request, res: Response) => {
     res.setHeader("Content-Type", m as string);
     res.send(buffer);
   } catch (err) {
+    res.status(500).json({ ok: false, error: String(err) });
+  }
+});
+
+// ----------- History on-demand
+
+app.post("/wa/fetch-history", requireGatewayAuth, async (req: Request, res: Response) => {
+  const { orgId, peer, count = 50, oldestMsgId, oldestMsgTimestamp } = req.body || {};
+  if (!orgId || !peer) {
+    return res.status(400).json({ ok: false, error: "orgId,peer required" });
+  }
+
+  const s = getSessionOr404(String(orgId), res);
+  if (!s) return;
+
+  try {
+    let refKey: any;
+    let refTs: number;
+
+    if (oldestMsgId && oldestMsgTimestamp) {
+      refKey = { id: String(oldestMsgId), remoteJid: String(peer), fromMe: false };
+      refTs = Number(oldestMsgTimestamp);
+    } else {
+      let oldestMsg: WAMessage | null = null;
+      let oldestT = Infinity;
+      s.msgCache.forEach((msg) => {
+        if (msg.key.remoteJid === String(peer)) {
+          const ts = Number(msg.messageTimestamp || 0);
+          if (ts > 0 && ts < oldestT) { oldestT = ts; oldestMsg = msg; }
+        }
+      });
+      if (!oldestMsg) {
+        return res.status(404).json({ ok: false, error: "No cached messages found for this peer" });
+      }
+      refKey = (oldestMsg as WAMessage).key;
+      refTs = Number((oldestMsg as WAMessage).messageTimestamp || 0);
+    }
+
+    const requestId = await (s.sock! as any).fetchMessageHistory(Number(count), refKey, refTs);
+    logger.info({ orgId, peer, count, requestId }, "fetch-history requested");
+    res.json({ ok: true, requestId, peer, count });
+  } catch (err) {
+    logger.error({ err, orgId, peer }, "/wa/fetch-history error");
     res.status(500).json({ ok: false, error: String(err) });
   }
 });
