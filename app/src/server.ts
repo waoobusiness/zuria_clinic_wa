@@ -484,7 +484,7 @@ async function startSession(orgId: string): Promise<Session> {
       },
       browser: ["Zuria", "Chrome", "1.0.0"],
       logger,
-      syncFullHistory: false,
+      syncFullHistory: true,
       markOnlineOnConnect: false,
     });
 
@@ -588,6 +588,7 @@ async function startSession(orgId: string): Promise<Session> {
 
       // Forward ALL history messages to webhook → Supabase (syncType 2=initial, 3=ON_DEMAND)
       // Supabase webhook handles deduplication via message_id unique constraint
+      const ninetyDaysAgo = Math.floor(Date.now() / 1000) - 90 * 24 * 60 * 60;
       logger.info({ orgId, syncType, msgCount: Array.isArray(messages) ? messages.length : 0 }, "messaging-history.set received");
       if (Array.isArray(messages) && messages.length) {
         for (const msg of messages as WAMessage[]) {
@@ -596,6 +597,11 @@ async function startSession(orgId: string): Promise<Session> {
           if (!remoteJid) continue;
           // Skip status and broadcast
           if (remoteJid === "status@broadcast" || remoteJid.includes("newsletter")) continue;
+          // Only sync messages from last 90 days
+          const ninetyDaysAgo = Math.floor(Date.now() / 1000) - 90 * 24 * 60 * 60;
+          if (Number(msg.messageTimestamp || 0) < ninetyDaysAgo) continue;
+          // Only sync messages from last 90 days to avoid overwhelming Supabase
+          if (Number(msg.messageTimestamp || 0) < ninetyDaysAgo) continue;
           const phone = jidToPhone(remoteJid);
           const simplified = {
             id: msg.key.id,
